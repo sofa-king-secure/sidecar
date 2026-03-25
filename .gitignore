@@ -1,0 +1,52 @@
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.xcuserstate
+*.xcscmblueprint
+*.xcscheme
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+Packages/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+DerivedData/
+build/
+*.dSYM.zip
+*.dSYM
+*.o
+*.d
+
+# Archives
+*.ipa
+*.xcarchive
+
+# Crash logs
+*.crash
+
+# Test output
+.test-results/
+
+# Environment
+.env
+.env.local
