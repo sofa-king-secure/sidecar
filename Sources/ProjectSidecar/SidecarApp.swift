@@ -173,6 +173,8 @@ final class SidecarAppState: ObservableObject {
         if showOnboarding {
             status = .needsSetup
         } else {
+            // No onboarding needed — run as menu bar only (no Dock icon).
+            NSApp.setActivationPolicy(.accessory)
             startMonitoring()
         }
     }
@@ -181,7 +183,11 @@ final class SidecarAppState: ObservableObject {
 
     func onboardingCompleted() {
         showOnboarding = false
+        // Hide from Dock — this is a menu bar app.
+        NSApp.setActivationPolicy(.accessory)
         startMonitoring()
+        print("[Sidecar] ✅ Setup complete. Monitoring /Applications for new installs.")
+        print("[Sidecar] Look for the drive icon in your menu bar.")
     }
 
     func resetOnboarding() {

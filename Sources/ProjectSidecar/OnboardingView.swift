@@ -470,6 +470,8 @@ struct OnboardingView: View {
                 Button("Start Sidecar") {
                     config.completeOnboarding()
                     onComplete()
+                    // Close the onboarding window.
+                    NSApplication.shared.keyWindow?.close()
                 }
                 .buttonStyle(.borderedProminent)
             }
