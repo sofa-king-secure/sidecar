@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -26,16 +27,14 @@ struct ProjectSidecarApp: App {
     @StateObject private var appState = SidecarAppState()
 
     var body: some Scene {
-        // Onboarding window — shown only on first run.
-        if appState.showOnboarding {
-            WindowGroup("Sidecar Setup") {
-                OnboardingView(config: SidecarConfig.shared) {
-                    appState.onboardingCompleted()
-                }
+        // Onboarding window — always declared, visibility controlled by appState.
+        WindowGroup("Sidecar Setup", id: "onboarding") {
+            OnboardingView(config: SidecarConfig.shared) {
+                appState.onboardingCompleted()
             }
-            .windowResizability(.contentSize)
-            .defaultPosition(.center)
         }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
 
         // Menu bar — always present, but functional only after onboarding.
         MenuBarExtra("Sidecar", systemImage: appState.menuBarIcon) {

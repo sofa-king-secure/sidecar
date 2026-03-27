@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// First-run onboarding wizard. Shown once on initial launch.
@@ -97,7 +98,7 @@ struct OnboardingView: View {
         VStack(spacing: 20) {
             Image(systemName: "externaldrive.badge.plus")
                 .font(.system(size: 64))
-                .foregroundStyle(.accent)
+                .foregroundColor(.accentColor)
 
             Text("Welcome to Sidecar")
                 .font(.largeTitle.bold())
@@ -122,7 +123,7 @@ struct OnboardingView: View {
         HStack(spacing: 12) {
             Image(systemName: icon)
                 .frame(width: 24)
-                .foregroundStyle(.accent)
+                .foregroundColor(.accentColor)
             Text(text)
                 .font(.callout)
         }
@@ -179,7 +180,7 @@ struct OnboardingView: View {
         HStack {
             Image(systemName: volume.isReady ? "externaldrive.fill" : "externaldrive.badge.xmark")
                 .font(.title2)
-                .foregroundStyle(volume.isReady ? .accent : .red)
+                .foregroundColor(volume.isReady ? .accentColor : .red)
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
@@ -202,7 +203,7 @@ struct OnboardingView: View {
 
             if selectedVolume?.id == volume.id {
                 Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.accent)
+                    .foregroundColor(.accentColor)
             }
         }
         .padding(12)
@@ -354,7 +355,7 @@ struct OnboardingView: View {
 
         return HStack {
             Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(isSelected ? .accent : .secondary)
+                .foregroundColor(isSelected ? .accentColor : .secondary)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(appName).font(.callout.bold())

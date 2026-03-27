@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// Filters out Apple-signed and system applications so only third-party
 /// apps are candidates for migration.

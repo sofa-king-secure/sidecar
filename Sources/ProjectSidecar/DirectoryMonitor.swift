@@ -95,11 +95,7 @@ final class DirectoryMonitor: @unchecked Sendable {
         }
 
         self.stream = newStream
-        FSEventStreamScheduleWithRunLoop(
-            newStream,
-            CFRunLoopGetMain(),
-            CFRunLoopMode.defaultMode.rawValue
-        )
+        FSEventStreamSetDispatchQueue(newStream, DispatchQueue.main)
         FSEventStreamStart(newStream)
     }
 

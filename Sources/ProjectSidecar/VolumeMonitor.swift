@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Monitors the availability of the user-configured external volume
