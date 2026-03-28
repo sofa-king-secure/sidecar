@@ -16,11 +16,30 @@ struct AppFilter: Sendable {
         "/System/Library"
     ]
 
+    /// Bundle identifiers that must never be migrated.
+    /// Sidecar itself is here — moving it to the external drive would
+    /// break everything if the drive disconnects.
+    private static let excludedBundleIDs: Set<String> = [
+        "com.projectsidecar.app"
+    ]
+
+    /// App names (case-insensitive) that must never be migrated,
+    /// as a fallback when the bundle ID can't be read.
+    private static let excludedAppNames: Set<String> = [
+        "sidecar"
+    ]
+
     // MARK: - Public API
 
     /// Returns `true` if the app at `appURL` is a third-party app that
     /// should be considered for migration.
     func shouldProcess(appURL: URL) async throws -> Bool {
+        // 0. Never migrate ourselves.
+        let appName = appURL.deletingPathExtension().lastPathComponent.lowercased()
+        if Self.excludedAppNames.contains(appName) {
+            return false
+        }
+
         // 1. Reject anything under an excluded system path.
         let resolvedPath = appURL.path
         for prefix in Self.excludedPrefixes {
@@ -29,10 +48,14 @@ struct AppFilter: Sendable {
             }
         }
 
-        // 2. Reject apps whose bundle identifier starts with "com.apple.".
-        if let bundleID = bundleIdentifier(for: appURL),
-           bundleID.hasPrefix("com.apple.") {
-            return false
+        // 2. Reject apps whose bundle identifier is excluded or starts with "com.apple.".
+        if let bundleID = bundleIdentifier(for: appURL) {
+            if Self.excludedBundleIDs.contains(bundleID) {
+                return false
+            }
+            if bundleID.hasPrefix("com.apple.") {
+                return false
+            }
         }
 
         // 3. Reject Apple-signed apps via code-signing metadata (native API).
