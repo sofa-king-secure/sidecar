@@ -24,7 +24,9 @@ You bought a MacBook with a 256GB or 512GB drive. After macOS, Xcode, Docker, a 
 - Checks Full Disk Access permissions
 - Scans existing apps and recommends what to migrate
 
-### 📦 Full-Footprint Migration
+### 📦 Library-Only Migration (v0.2)
+macOS Launch Services blocks apps launched via symlinks to external drives. So Sidecar takes the smarter approach: **the .app bundle stays in /Applications** while the Library data — where the real disk space lives — gets moved to the external drive and symlinked.
+
 Not just the `.app` bundle — Sidecar scans **9 Library directories** per app:
 
 | Directory | Typical Contents | Symlink Safe? |

@@ -109,8 +109,9 @@ final class MigrationManifest {
 
     // MARK: - Public API: Rollback
 
-    /// Undo a migration: move app back from external to internal,
-    /// remove the symlink, and move library data back.
+    /// Undo a migration: restore Library data from external to internal,
+    /// removing symlinks.
+    /// Note (v0.2): App bundle is not moved — it stays in /Applications.
     func rollback(recordID: String) async throws {
         guard let index = records.firstIndex(where: { $0.id == recordID }) else {
             throw ManifestError.recordNotFound
@@ -118,24 +119,10 @@ final class MigrationManifest {
 
         let record = records[index]
 
-        // 1. Remove the symlink at original location.
-        let symlinkURL = URL(fileURLWithPath: record.symlinkPath)
-        if fileManager.fileExists(atPath: record.symlinkPath) {
-            // Verify it's actually a symlink before removing.
-            let resourceValues = try? symlinkURL.resourceValues(forKeys: [.isSymbolicLinkKey])
-            if resourceValues?.isSymbolicLink == true {
-                try fileManager.removeItem(at: symlinkURL)
-            }
-        }
+        // v0.2: App bundle stays local, so skip app bundle rollback.
+        // Only roll back library data.
 
-        // 2. Move the app bundle back from external.
-        let externalURL = URL(fileURLWithPath: record.externalPath)
-        let originalURL = URL(fileURLWithPath: record.originalPath)
-        if fileManager.fileExists(atPath: externalURL.path) {
-            try fileManager.moveItem(at: externalURL, to: originalURL)
-        }
-
-        // 3. Roll back library data.
+        // Roll back library data.
         for libRecord in record.libraryMigrations {
             let extLibURL = URL(fileURLWithPath: libRecord.externalPath)
             let origLibURL = URL(fileURLWithPath: libRecord.originalPath)

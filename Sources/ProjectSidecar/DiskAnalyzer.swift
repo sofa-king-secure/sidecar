@@ -190,10 +190,11 @@ struct DiskAnalyzer {
     }
 
     /// Estimate how many bytes we'd reclaim on the internal drive.
+    /// App bundle stays local (v0.2) — only Library data is reclaimable.
     /// Symlink-safe items: full reclaim. Unsafe items (containers):
     /// conservative estimate since we may need to copy, not move.
     private func computeReclaimable(footprint: LibraryScanner.AppFootprint) -> UInt64 {
-        var total: UInt64 = footprint.appBundleSize  // The .app itself
+        var total: UInt64 = 0  // App bundle NOT included — stays on internal drive
 
         for item in footprint.libraryItems {
             if item.category.symlinkSafe {

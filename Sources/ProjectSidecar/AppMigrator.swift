@@ -1,21 +1,25 @@
 import Foundation
 
-/// Handles the actual file migration: moving an app bundle AND its
-/// associated ~/Library data to the external volume, replacing
-/// originals with symbolic links.
+/// Handles migration of application Library data to an external volume,
+/// replacing originals with symbolic links.
 ///
-/// Upgraded from bundle-only to full-footprint migration:
-///   - Moves the .app bundle → symlinks it
-///   - Moves safe Library data (App Support, Caches, etc.) → symlinks them
-///   - Copies sandboxed containers (can't reliably symlink) → periodic sync
-///   - Records everything in MigrationManifest for rollback
+/// KEY DESIGN DECISION (v0.2):
+///   macOS Launch Services refuses to open .app bundles via symlinks to
+///   external volumes (error -10657). The .app bundle STAYS on the internal
+///   drive. Only ~/Library data is migrated — this is where the real disk
+///   space lives anyway.
+///
+///   - App bundle: STAYS in /Applications (untouched)
+///   - Safe Library data (App Support, Caches, etc.): moved → symlinked
+///   - Sandboxed containers: copied to external as backup (not symlinked)
+///   - Everything recorded in MigrationManifest for rollback
 ///
 /// Per CLAUDE.md: async/await, native APIs only.
 final class AppMigrator {
 
     // MARK: - Types
 
-    /// User's chosen resolution when an app already exists on the external drive.
+    /// User's chosen resolution when data already exists on the external drive.
     enum ConflictResolution: Sendable {
         case overwrite
         case linkOnly
@@ -35,6 +39,7 @@ final class AppMigrator {
         case symlinkFailed(path: String, underlying: Error)
         case removeOriginalFailed(path: String, underlying: Error)
         case rollbackFailed(underlying: Error)
+        case noLibraryDataToMigrate
 
         var description: String {
             switch self {
@@ -48,6 +53,8 @@ final class AppMigrator {
                 return "Failed to remove \(p): \(e.localizedDescription)"
             case .rollbackFailed(let e):
                 return "Rollback failed: \(e.localizedDescription)"
+            case .noLibraryDataToMigrate:
+                return "No Library data found to migrate for this app."
             }
         }
     }
@@ -69,53 +76,39 @@ final class AppMigrator {
         self.manifest = manifest
     }
 
-    // MARK: - Public API: Full Footprint Migration
+    // MARK: - Public API: Library-Only Migration
 
-    /// Migrate an app's full footprint (bundle + library data).
-    func migrateFullFootprint(
+    /// Migrate an app's Library data to the external drive.
+    /// The .app bundle stays in /Applications — only Library data moves.
+    ///
+    /// This is the primary migration method (v0.2+).
+    func migrateLibraryData(
         footprint: LibraryScanner.AppFootprint,
         externalBase: URL,
         conflictHandler: @Sendable (URL) async -> ConflictResolution,
         progressHandler: (@Sendable (MigrationProgress) -> Void)? = nil
     ) async throws {
         let appName = footprint.appBundleURL.lastPathComponent
-        let externalAppsDir = externalBase.appendingPathComponent("Applications")
         let externalLibDir = externalBase.appendingPathComponent("Library")
-        let appDestination = externalAppsDir.appendingPathComponent(appName)
 
+        // Filter to items we'll actually migrate.
+        let migratable = footprint.libraryItems.filter { strategyFor(item: $0) != .skip }
+
+        if migratable.isEmpty {
+            throw MigrationError.noLibraryDataToMigrate
+        }
+
+        let bytesTotal = migratable.reduce(0) { $0 + $1.sizeBytes }
         var bytesCompleted: UInt64 = 0
-        let bytesTotal = footprint.totalSize
-
-        // ── Step 1: Migrate the .app bundle ──
 
         progressHandler?(MigrationProgress(
-            phase: "App Bundle",
-            detail: "Moving \(appName)...",
-            bytesCompleted: bytesCompleted,
+            phase: "Library Data",
+            detail: "Migrating data for \(appName)...",
+            bytesCompleted: 0,
             bytesTotal: bytesTotal
         ))
 
-        try ensureDirectory(at: externalAppsDir)
-
-        if fileManager.fileExists(atPath: appDestination.path) {
-            let resolution = await conflictHandler(appDestination)
-            switch resolution {
-            case .overwrite:
-                try removeItem(at: appDestination)
-                try moveAndLink(source: footprint.appBundleURL, destination: appDestination)
-            case .linkOnly:
-                try removeItem(at: footprint.appBundleURL)
-                try createSymlink(at: footprint.appBundleURL, pointingTo: appDestination)
-            case .skip:
-                return
-            }
-        } else {
-            try moveAndLink(source: footprint.appBundleURL, destination: appDestination)
-        }
-
-        bytesCompleted += footprint.appBundleSize
-
-        // ── Step 2: Migrate library data ──
+        // ── Migrate each library item ──
 
         var libraryRecords: [MigrationManifest.LibraryMigrationRecord] = []
 
@@ -138,7 +131,27 @@ final class AppMigrator {
             switch strategy {
             case .symlinkMove:
                 if fileManager.fileExists(atPath: extDestination.path) {
-                    try removeItem(at: extDestination)
+                    let resolution = await conflictHandler(extDestination)
+                    switch resolution {
+                    case .overwrite:
+                        try removeItem(at: extDestination)
+                    case .linkOnly:
+                        // Remove local, link to existing external copy.
+                        try removeItem(at: item.url)
+                        try createSymlink(at: item.url, pointingTo: extDestination)
+                        libraryRecords.append(MigrationManifest.LibraryMigrationRecord(
+                            category: item.category.rawValue,
+                            originalPath: item.url.path,
+                            externalPath: extDestination.path,
+                            sizeBytes: item.sizeBytes,
+                            isSymlinked: true
+                        ))
+                        bytesCompleted += item.sizeBytes
+                        continue
+                    case .skip:
+                        bytesCompleted += item.sizeBytes
+                        continue
+                    }
                 }
                 try moveAndLink(source: item.url, destination: extDestination)
 
@@ -170,58 +183,28 @@ final class AppMigrator {
             bytesCompleted += item.sizeBytes
         }
 
-        // ── Step 3: Record in manifest ──
+        // ── Record in manifest ──
+        // Note: originalPath/externalPath still reference the .app for identification,
+        // but the app bundle itself is NOT moved in v0.2+.
 
         manifest.recordMigration(
             appName: appName,
             bundleIdentifier: footprint.bundleIdentifier,
             originalPath: footprint.appBundleURL.path,
-            externalPath: appDestination.path,
+            externalPath: footprint.appBundleURL.path,  // Same — bundle stays local
             libraryMigrations: libraryRecords
+        )
+
+        let totalMigrated = ByteCountFormatter.string(
+            fromByteCount: Int64(bytesCompleted), countStyle: .file
         )
 
         progressHandler?(MigrationProgress(
             phase: "Complete",
-            detail: "\(appName) migrated successfully.",
+            detail: "\(appName): \(totalMigrated) of Library data migrated.",
             bytesCompleted: bytesTotal,
             bytesTotal: bytesTotal
         ))
-    }
-
-    // MARK: - Public API: Simple Bundle-Only Migration (backward compat)
-
-    func migrate(
-        appURL: URL,
-        to externalDir: URL,
-        conflictHandler: @Sendable (URL) async -> ConflictResolution
-    ) async throws {
-        let appName = appURL.lastPathComponent
-        let destinationURL = externalDir.appendingPathComponent(appName)
-
-        try ensureDirectory(at: externalDir)
-
-        if fileManager.fileExists(atPath: destinationURL.path) {
-            let resolution = await conflictHandler(destinationURL)
-            switch resolution {
-            case .overwrite:
-                try removeItem(at: destinationURL)
-                try moveAndLink(source: appURL, destination: destinationURL)
-            case .linkOnly:
-                try removeItem(at: appURL)
-                try createSymlink(at: appURL, pointingTo: destinationURL)
-            case .skip:
-                return
-            }
-        } else {
-            try moveAndLink(source: appURL, destination: destinationURL)
-        }
-
-        manifest.recordMigration(
-            appName: appName,
-            bundleIdentifier: nil,
-            originalPath: appURL.path,
-            externalPath: destinationURL.path
-        )
     }
 
     // MARK: - Strategy

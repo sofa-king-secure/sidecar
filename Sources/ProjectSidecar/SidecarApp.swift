@@ -283,7 +283,7 @@ final class SidecarAppState: ObservableObject {
         }
 
         do {
-            try await migrator.migrateFullFootprint(
+            try await migrator.migrateLibraryData(
                 footprint: footprint,
                 externalBase: volumePath,
                 conflictHandler: { [weak self] url in
@@ -338,7 +338,7 @@ final class SidecarAppState: ObservableObject {
 
         for candidate in plan.toMigrate {
             do {
-                try await migrator.migrateFullFootprint(
+                try await migrator.migrateLibraryData(
                     footprint: candidate.footprint,
                     externalBase: volumePath,
                     conflictHandler: { [weak self] url in
@@ -405,16 +405,18 @@ final class SidecarAppState: ObservableObject {
 
     private func promptMigration(candidate: DiskAnalyzer.MigrationCandidate) async -> Bool {
         await withCheckedContinuation { continuation in
+            let appName = candidate.footprint.appBundleURL.deletingPathExtension().lastPathComponent
+            let libCount = candidate.footprint.libraryItems.count
             let alert = NSAlert()
-            alert.messageText = "Migrate \(candidate.footprint.appBundleURL.deletingPathExtension().lastPathComponent)?"
+            alert.messageText = "Migrate \(appName) Library data?"
             alert.informativeText = """
-                Total footprint: \(candidate.footprint.formattedTotalSize)
-                Reclaimable: ~\(candidate.formattedReclaimable)
-                Library folders: \(candidate.footprint.libraryItems.count)
+                App stays in /Applications (untouched).
+                Library data to move: \(libCount) folder(s)
+                Space reclaimable: ~\(candidate.formattedReclaimable)
                 \(candidate.reasoning)
                 """
             alert.alertStyle = .informational
-            alert.addButton(withTitle: "Migrate")
+            alert.addButton(withTitle: "Migrate Data")
             alert.addButton(withTitle: "Skip")
             continuation.resume(returning: alert.runModal() == .alertFirstButtonReturn)
         }
