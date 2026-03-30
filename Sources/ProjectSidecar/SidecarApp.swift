@@ -157,6 +157,7 @@ final class SidecarAppState: ObservableObject {
     private var volumeMonitor: VolumeMonitor?
     private let manifest = MigrationManifest()
     private lazy var migrator = AppMigrator(manifest: manifest)
+    private lazy var disconnectGuard = DisconnectGuard(manifest: manifest)
     private let libraryScanner = LibraryScanner()
     private let diskAnalyzer = DiskAnalyzer()
     private let config = SidecarConfig.shared
@@ -223,6 +224,8 @@ final class SidecarAppState: ObservableObject {
                 switch state {
                 case .mounted:
                     self.status = .active
+                    // Restore symlinks and merge any data written while disconnected.
+                    self.disconnectGuard.onDriveReconnected()
                     try? self.directoryMonitor?.start()
                     if self.config.preferences.runHealthCheckOnMount {
                         self.runHealthCheck()
@@ -230,6 +233,9 @@ final class SidecarAppState: ObservableObject {
                 case .missing:
                     self.status = .driveMissing
                     self.directoryMonitor?.stop()
+                    // Replace dead symlinks with placeholders and start
+                    // monitoring for migrated app launches.
+                    self.disconnectGuard.onDriveDisconnected()
                 }
             }
         }
