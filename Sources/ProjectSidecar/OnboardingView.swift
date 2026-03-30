@@ -234,8 +234,8 @@ struct OnboardingView: View {
 
             VStack(alignment: .leading, spacing: 16) {
                 checkRow(
-                    label: "Full Disk Access",
-                    detail: "Required to move apps in /Applications",
+                    label: "Library Access",
+                    detail: "Can read and write ~/Library data",
                     passed: checkFullDiskAccess()
                 )
 
@@ -269,12 +269,9 @@ struct OnboardingView: View {
             .frame(maxWidth: 440, alignment: .leading)
 
             if !checkFullDiskAccess() {
-                Button("Open System Settings") {
-                    NSWorkspace.shared.open(
-                        URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
-                    )
-                }
-                .buttonStyle(.borderedProminent)
+                Text("Cannot write to ~/Library. Check your user permissions.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
             }
         }
         .onAppear {
@@ -505,7 +502,11 @@ struct OnboardingView: View {
     }
 
     private func checkFullDiskAccess() -> Bool {
-        // Heuristic: try to read a protected path.
-        return FileManager.default.isReadableFile(atPath: "/Library/Application Support/com.apple.TCC/TCC.db")
+        // v0.2: We only move ~/Library data (user-owned), not .app bundles.
+        // Check that we can read and write to ~/Library/Application Support,
+        // which is where most app data lives.
+        let testPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support")
+        return FileManager.default.isWritableFile(atPath: testPath.path)
     }
 }
