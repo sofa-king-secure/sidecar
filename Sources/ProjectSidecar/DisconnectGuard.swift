@@ -1,39 +1,20 @@
 import AppKit
 import Foundation
 
-/// Protects migrated apps when the external drive is disconnected.
+/// Protects migrated sub-directories when the external drive is disconnected.
 ///
-/// When the drive unmounts:
-///   1. Replaces dead symlinks with empty placeholder directories
-///      so apps can launch without crashing.
-///   2. Monitors for launches of migrated apps and warns the user.
-///
-/// When the drive reconnects:
-///   1. Removes placeholder directories (if unchanged).
-///   2. Restores symlinks to the external drive.
-///   3. If the app wrote new data while disconnected, merges it back.
-///
-/// This is the safety net that makes library-only migration viable.
+/// On disconnect: replaces dead symlinks with empty placeholder directories.
+/// On app launch without drive: warns the user with options.
+/// On reconnect: restores symlinks, merges any locally-written data.
 final class DisconnectGuard {
 
-    // MARK: - Types
-
-    /// State of a placeholder directory.
     struct PlaceholderInfo: Codable {
-        let originalSymlinkTarget: String  // Where the symlink pointed
-        let localPath: String              // The placeholder directory path
+        let originalSymlinkTarget: String
+        let localPath: String
         let appName: String
         let createdAt: Date
-        var wasModified: Bool              // Did the app write data while disconnected?
+        var wasModified: Bool
     }
-
-    enum GuardAction: Sendable {
-        case continueWithoutData  // User accepts running without their data
-        case quitApp              // User wants to quit and connect drive
-        case cancel               // Don't launch
-    }
-
-    // MARK: - Properties
 
     private let manifest: MigrationManifest
     private let fileManager = FileManager.default
@@ -48,53 +29,38 @@ final class DisconnectGuard {
         return dir.appendingPathComponent("placeholders.json")
     }()
 
-    // MARK: - Init
-
     init(manifest: MigrationManifest) {
         self.manifest = manifest
         loadPlaceholders()
     }
 
-    // MARK: - Public API: Drive Disconnected
+    // MARK: - Drive Disconnected
 
-    /// Called when the external drive unmounts.
-    /// Replaces dead symlinks with empty placeholder directories
-    /// and starts monitoring for migrated app launches.
     func onDriveDisconnected() {
-        print("[Sidecar] Drive disconnected — activating disconnect guard.")
+        print("[Sidecar] Drive disconnected — creating placeholders for dead symlinks.")
 
         let activeRecords = manifest.activeRecords
 
         for record in activeRecords {
-            for libMigration in record.libraryMigrations where libMigration.isSymlinked {
-                let localPath = libMigration.originalPath
-                let targetPath = libMigration.externalPath
-
-                // Check if it's a dead symlink (points to unmounted volume).
-                if isDeadSymlink(at: localPath) {
+            for lib in record.libraryMigrations where lib.isSymlinked {
+                if isDeadSymlink(at: lib.originalPath) {
                     do {
-                        // Remove the dead symlink.
-                        try fileManager.removeItem(atPath: localPath)
-
-                        // Create an empty placeholder directory.
+                        try fileManager.removeItem(atPath: lib.originalPath)
                         try fileManager.createDirectory(
-                            atPath: localPath,
+                            atPath: lib.originalPath,
                             withIntermediateDirectories: true,
                             attributes: nil
                         )
-
-                        let info = PlaceholderInfo(
-                            originalSymlinkTarget: targetPath,
-                            localPath: localPath,
+                        placeholders.append(PlaceholderInfo(
+                            originalSymlinkTarget: lib.externalPath,
+                            localPath: lib.originalPath,
                             appName: record.appName,
                             createdAt: Date(),
                             wasModified: false
-                        )
-                        placeholders.append(info)
-
-                        print("[Sidecar] Created placeholder: \(localPath)")
+                        ))
+                        print("[Sidecar]   Placeholder: \(lib.originalPath)")
                     } catch {
-                        print("[Sidecar] Failed to create placeholder for \(localPath): \(error)")
+                        print("[Sidecar]   Failed: \(lib.originalPath): \(error)")
                     }
                 }
             }
@@ -104,58 +70,37 @@ final class DisconnectGuard {
         startAppLaunchMonitor()
     }
 
-    /// Called when the external drive reconnects.
-    /// Restores symlinks and handles any data written during disconnect.
+    // MARK: - Drive Reconnected
+
     func onDriveReconnected() {
         print("[Sidecar] Drive reconnected — restoring symlinks.")
 
         stopAppLaunchMonitor()
 
-        for (index, placeholder) in placeholders.enumerated() {
-            let localPath = placeholder.localPath
-            let targetPath = placeholder.originalSymlinkTarget
-
-            // Check if the placeholder directory was modified.
-            let modified = directoryHasContents(at: localPath)
+        for (index, ph) in placeholders.enumerated() {
+            let modified = directoryHasContents(at: ph.localPath)
 
             if modified {
                 placeholders[index].wasModified = true
-                print("[Sidecar] ⚠️ Data written while disconnected: \(localPath)")
-
-                // Move the locally-written data to a temp location for merge.
-                let tempPath = localPath + ".sidecar-disconnected"
+                let tempPath = ph.localPath + ".sidecar-disconnected"
                 do {
-                    try fileManager.moveItem(atPath: localPath, toPath: tempPath)
-
-                    // Restore the symlink.
-                    try fileManager.createSymbolicLink(
-                        atPath: localPath,
-                        withDestinationPath: targetPath
-                    )
-
-                    // Merge: copy disconnected data into the external location.
-                    if fileManager.fileExists(atPath: targetPath) {
-                        try mergeDirectories(from: tempPath, into: targetPath)
+                    try fileManager.moveItem(atPath: ph.localPath, toPath: tempPath)
+                    try fileManager.createSymbolicLink(atPath: ph.localPath, withDestinationPath: ph.originalSymlinkTarget)
+                    if fileManager.fileExists(atPath: ph.originalSymlinkTarget) {
+                        try mergeDirectories(from: tempPath, into: ph.originalSymlinkTarget)
                     }
-
-                    // Clean up temp.
                     try? fileManager.removeItem(atPath: tempPath)
-
-                    print("[Sidecar] ✅ Merged disconnected data and restored: \(localPath)")
+                    print("[Sidecar]   ✅ Merged + restored: \(ph.localPath)")
                 } catch {
-                    print("[Sidecar] ❌ Failed to restore \(localPath): \(error)")
+                    print("[Sidecar]   ❌ Failed to restore \(ph.localPath): \(error)")
                 }
             } else {
-                // Placeholder was empty — just remove and restore symlink.
                 do {
-                    try fileManager.removeItem(atPath: localPath)
-                    try fileManager.createSymbolicLink(
-                        atPath: localPath,
-                        withDestinationPath: targetPath
-                    )
-                    print("[Sidecar] ✅ Restored symlink: \(localPath)")
+                    try fileManager.removeItem(atPath: ph.localPath)
+                    try fileManager.createSymbolicLink(atPath: ph.localPath, withDestinationPath: ph.originalSymlinkTarget)
+                    print("[Sidecar]   ✅ Restored: \(ph.localPath)")
                 } catch {
-                    print("[Sidecar] ❌ Failed to restore symlink \(localPath): \(error)")
+                    print("[Sidecar]   ❌ Failed: \(ph.localPath): \(error)")
                 }
             }
         }
@@ -164,29 +109,24 @@ final class DisconnectGuard {
         savePlaceholders()
     }
 
-    // MARK: - App Launch Monitoring
+    // MARK: - App Launch Monitor
 
-    /// Watch for app launches. If a migrated app starts while the drive
-    /// is disconnected, warn the user.
     private func startAppLaunchMonitor() {
         let center = NSWorkspace.shared.notificationCenter
-
         appMonitor = center.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification,
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            guard let self else { return }
-            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  let bundleID = app.bundleIdentifier else { return }
+            guard let self,
+                  let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let bundleID = app.bundleIdentifier,
+                  let record = self.manifest.record(forBundleID: bundleID) else { return }
 
-            // Check if this is a migrated app.
-            if let record = self.manifest.record(forBundleID: bundleID) {
-                let hasPlaceholders = self.placeholders.contains { $0.appName == record.appName }
-                if hasPlaceholders {
-                    Task { @MainActor in
-                        await self.showDisconnectWarning(for: record, runningApp: app)
-                    }
+            let hasPlaceholders = self.placeholders.contains { $0.appName == record.appName }
+            if hasPlaceholders {
+                Task { @MainActor in
+                    await self.showDisconnectWarning(for: record, runningApp: app)
                 }
             }
         }
@@ -201,112 +141,77 @@ final class DisconnectGuard {
 
     // MARK: - Warning Dialog
 
-    /// Show the disconnect warning when a migrated app launches without the drive.
     @MainActor
     private func showDisconnectWarning(
         for record: MigrationManifest.MigrationRecord,
         runningApp: NSRunningApplication
     ) async {
         let appName = record.appName.replacingOccurrences(of: ".app", with: "")
-        let libCount = record.libraryMigrations.filter { $0.isSymlinked }.count
+        let itemCount = record.libraryMigrations.filter { $0.isSymlinked }.count
 
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.icon = NSImage(systemSymbolName: "externaldrive.trianglebadge.exclamationmark",
                             accessibilityDescription: "Drive missing")
 
-        alert.messageText = "\(appName) is running without its data"
+        alert.messageText = "\(appName) — external drive not connected"
         alert.informativeText = """
-            You migrated \(libCount) Library folder(s) for \(appName) to your \
-            external drive, but the drive isn't connected.
+            \(itemCount) data folder(s) for \(appName) live on your external drive, \
+            which isn't connected.
 
-            The app is running with empty placeholder data. Your settings, \
-            extensions, and cached data are on the external drive.
+            The app is running with empty placeholder data. Your settings should \
+            be fine, but cached data, extensions, and VM bundles may be missing.
 
-            Options:
-            • Quit \(appName), connect the drive, and relaunch for full access
-            • Continue — the app may behave like a fresh install. \
-            Any changes will be synced when the drive reconnects, \
-            but you may lose some session data
+            • Quit and connect the drive for full functionality
+            • Continue — changes will sync when the drive reconnects
             """
 
-        alert.addButton(withTitle: "Quit \(appName)")        // First button
-        alert.addButton(withTitle: "Continue Without Data")   // Second button
+        alert.addButton(withTitle: "Quit \(appName)")
+        alert.addButton(withTitle: "Continue Without Data")
 
         let response = alert.runModal()
-
-        switch response {
-        case .alertFirstButtonReturn:
-            // Quit the app.
+        if response == .alertFirstButtonReturn {
             runningApp.terminate()
-            print("[Sidecar] User chose to quit \(appName).")
-        default:
-            // User accepts the risk.
+            print("[Sidecar] User quit \(appName).")
+        } else {
             print("[Sidecar] User continuing \(appName) without external data.")
         }
     }
 
     // MARK: - Helpers
 
-    /// Check if a path is a symlink pointing to a non-existent target.
     private func isDeadSymlink(at path: String) -> Bool {
-        // Check if it's a symlink.
-        var isSymlink = false
-        if let attrs = try? fileManager.attributesOfItem(atPath: path),
-           let type = attrs[.type] as? FileAttributeType,
-           type == .typeSymbolicLink {
-            isSymlink = true
-        }
-
-        guard isSymlink else { return false }
-
-        // Check if target exists.
+        guard let attrs = try? fileManager.attributesOfItem(atPath: path),
+              let type = attrs[.type] as? FileAttributeType,
+              type == .typeSymbolicLink else { return false }
         let target = try? fileManager.destinationOfSymbolicLink(atPath: path)
-        if let target {
-            return !fileManager.fileExists(atPath: target)
-        }
-        return true
+        return target.map { !fileManager.fileExists(atPath: $0) } ?? true
     }
 
-    /// Check if a directory has any files in it.
     private func directoryHasContents(at path: String) -> Bool {
-        guard let contents = try? fileManager.contentsOfDirectory(atPath: path) else {
-            return false
-        }
-        // Filter out .DS_Store and other macOS cruft.
-        let meaningful = contents.filter { !$0.hasPrefix(".") }
-        return !meaningful.isEmpty
+        guard let contents = try? fileManager.contentsOfDirectory(atPath: path) else { return false }
+        return contents.contains { !$0.hasPrefix(".") }
     }
 
-    /// Merge contents of one directory into another.
-    /// Files in `from` overwrite files in `into` if they exist.
-    private func mergeDirectories(from sourcePath: String, into destPath: String) throws {
-        let sourceURL = URL(fileURLWithPath: sourcePath)
-        let destURL = URL(fileURLWithPath: destPath)
-
+    private func mergeDirectories(from source: String, into dest: String) throws {
+        let sourceURL = URL(fileURLWithPath: source)
+        let destURL = URL(fileURLWithPath: dest)
         guard let contents = try? fileManager.contentsOfDirectory(
-            at: sourceURL,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
+            at: sourceURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
         ) else { return }
 
-        for itemURL in contents {
-            let destItemURL = destURL.appendingPathComponent(itemURL.lastPathComponent)
-
-            if fileManager.fileExists(atPath: destItemURL.path) {
-                // Replace with the newer disconnected version.
-                try fileManager.removeItem(at: destItemURL)
+        for item in contents {
+            let destItem = destURL.appendingPathComponent(item.lastPathComponent)
+            if fileManager.fileExists(atPath: destItem.path) {
+                try fileManager.removeItem(at: destItem)
             }
-            try fileManager.moveItem(at: itemURL, to: destItemURL)
+            try fileManager.moveItem(at: item, to: destItem)
         }
     }
-
-    // MARK: - Persistence
 
     private func savePlaceholders() {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted]
         guard let data = try? encoder.encode(placeholders) else { return }
         try? data.write(to: placeholderManifestURL, options: .atomic)
     }

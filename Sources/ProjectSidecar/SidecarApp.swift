@@ -2,24 +2,13 @@ import AppKit
 import Foundation
 import SwiftUI
 
-/// Application entry point.
+/// Application entry point (v0.3).
 ///
-/// Launch flow:
-///   1. Check SidecarConfig — has onboarding completed?
-///   2. If NOT → show OnboardingView (setup wizard)
-///   3. If YES → start menu bar app with monitoring
-///
-/// Architecture:
-///   SidecarConfig    → persistent settings, drive history, first-run flag
-///   DriveSetup       → discover volumes, validate filesystem, initialize
-///   OnboardingView   → 5-step SwiftUI wizard (welcome → drive → check → scan → done)
-///   DirectoryMonitor → detects new .app in /Applications
-///   AppFilter        → rejects Apple/system apps
-///   LibraryScanner   → discovers full disk footprint (app + ~/Library data)
-///   DiskAnalyzer     → scores and prioritizes by size & disk pressure
-///   AppMigrator      → moves files + creates symlinks + records manifest
-///   MigrationManifest→ tracks everything for rollback & health checks
-///   VolumeMonitor    → pauses everything when drive disconnects
+/// Changes from v0.2:
+///   - Removed WindowGroup for onboarding (caused window lifecycle issues)
+///   - Onboarding now opens as a standalone NSWindow
+///   - Scan & Recommend shows per-item selection
+///   - Uses sub-directory migration strategy
 
 @main
 struct ProjectSidecarApp: App {
@@ -27,16 +16,6 @@ struct ProjectSidecarApp: App {
     @StateObject private var appState = SidecarAppState()
 
     var body: some Scene {
-        // Onboarding window — always declared, visibility controlled by appState.
-        WindowGroup("Sidecar Setup", id: "onboarding") {
-            OnboardingView(config: SidecarConfig.shared) {
-                appState.onboardingCompleted()
-            }
-        }
-        .windowResizability(.contentSize)
-        .defaultPosition(.center)
-
-        // Menu bar — always present, but functional only after onboarding.
         MenuBarExtra("Sidecar", systemImage: appState.menuBarIcon) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(appState.statusLabel)
@@ -59,33 +38,25 @@ struct ProjectSidecarApp: App {
 
             Divider()
 
-            if appState.showOnboarding {
-                Button("Complete Setup...") {
-                    // Re-focus onboarding window.
-                    NSApp.activate(ignoringOtherApps: true)
-                }
-            } else {
-                Button("Scan & Recommend...") {
-                    Task { await appState.runFullScan() }
-                }
-                .disabled(appState.status == .driveMissing)
+            Button("Scan & Migrate...") {
+                Task { await appState.runScanAndMigrate() }
+            }
+            .disabled(appState.status == .driveMissing)
 
-                Button("Health Check") {
-                    appState.runHealthCheck()
-                }
+            Button("Health Check") {
+                appState.runHealthCheck()
+            }
+
+            Divider()
+
+            Menu("Settings") {
+                Toggle("Auto-prompt for new apps", isOn: $appState.autoMigrate)
+                Toggle("Launch at login", isOn: $appState.launchAtLogin)
 
                 Divider()
 
-                Menu("Settings") {
-                    Toggle("Auto-migrate new apps", isOn: $appState.autoMigrate)
-                    Toggle("Migrate Library data", isOn: $appState.migrateLibrary)
-                    Toggle("Launch at login", isOn: $appState.launchAtLogin)
-
-                    Divider()
-
-                    Button("Reset & Re-run Setup...") {
-                        appState.resetOnboarding()
-                    }
+                Button("Reset Configuration...") {
+                    appState.resetOnboarding()
                 }
             }
 
@@ -103,28 +74,15 @@ struct ProjectSidecarApp: App {
 @MainActor
 final class SidecarAppState: ObservableObject {
 
-    // MARK: Published
-
     @Published var status: Status = .idle
     @Published var diskInfoLabel: String?
     @Published var migratedCountLabel: String?
-    @Published var showOnboarding: Bool
 
     @Published var autoMigrate: Bool {
-        didSet {
-            SidecarConfig.shared.updatePreferences { $0.autoMigrateNewApps = autoMigrate }
-        }
-    }
-    @Published var migrateLibrary: Bool {
-        didSet {
-            SidecarConfig.shared.updatePreferences { $0.migrateLibraryData = migrateLibrary }
-        }
+        didSet { SidecarConfig.shared.updatePreferences { $0.autoMigrateNewApps = autoMigrate } }
     }
     @Published var launchAtLogin: Bool {
-        didSet {
-            SidecarConfig.shared.updatePreferences { $0.launchAtLogin = launchAtLogin }
-            // TODO: Actually register/unregister the LaunchAgent plist.
-        }
+        didSet { SidecarConfig.shared.updatePreferences { $0.launchAtLogin = launchAtLogin } }
     }
 
     enum Status {
@@ -162,54 +120,78 @@ final class SidecarAppState: ObservableObject {
     private let diskAnalyzer = DiskAnalyzer()
     private let config = SidecarConfig.shared
 
-    // MARK: Init
-
     init() {
-        // Initialize manifest and dependents first, before accessing self.
         let manifest = MigrationManifest()
         self.manifest = manifest
         self.migrator = AppMigrator(manifest: manifest)
         self.disconnectGuard = DisconnectGuard(manifest: manifest)
 
         let prefs = SidecarConfig.shared.state.preferences
-        self.showOnboarding = SidecarConfig.shared.needsOnboarding
         self.autoMigrate = prefs.autoMigrateNewApps
-        self.migrateLibrary = prefs.migrateLibraryData
         self.launchAtLogin = prefs.launchAtLogin
 
-        if showOnboarding {
+        if SidecarConfig.shared.needsOnboarding {
             status = .needsSetup
+            // Open onboarding as a standalone window.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.openOnboardingWindow()
+            }
         } else {
-            // No onboarding needed — run as menu bar only (no Dock icon).
             NSApp.setActivationPolicy(.accessory)
             startMonitoring()
         }
     }
 
-    // MARK: - Onboarding
+    // MARK: - Onboarding Window
+
+    private var onboardingWindow: NSWindow?
+
+    func openOnboardingWindow() {
+        if let existing = onboardingWindow, existing.isVisible {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let view = OnboardingView(config: SidecarConfig.shared) { [weak self] in
+            self?.onboardingCompleted()
+        }
+
+        let hostingController = NSHostingController(rootView: view)
+        let window = NSWindow(contentViewController: hostingController)
+        window.title = "Sidecar Setup"
+        window.setContentSize(NSSize(width: 600, height: 520))
+        window.styleMask = [.titled, .closable]
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        self.onboardingWindow = window
+    }
 
     func onboardingCompleted() {
-        showOnboarding = false
-        // Hide from Dock — this is a menu bar app.
+        onboardingWindow?.close()
+        onboardingWindow = nil
         NSApp.setActivationPolicy(.accessory)
         startMonitoring()
         print("[Sidecar] ✅ Setup complete. Monitoring /Applications for new installs.")
-        print("[Sidecar] Look for the drive icon in your menu bar.")
     }
 
     func resetOnboarding() {
         directoryMonitor?.stop()
         volumeMonitor?.stop()
         config.reset()
-        showOnboarding = true
         status = .needsSetup
+        openOnboardingWindow()
     }
 
-    // MARK: - Start Monitoring (post-onboarding)
+    // MARK: - Start Monitoring
 
     private func startMonitoring() {
         guard let volumeName = config.configuredVolumeName else {
             status = .needsSetup
+            openOnboardingWindow()
             return
         }
 
@@ -218,8 +200,6 @@ final class SidecarAppState: ObservableObject {
         updateDiskInfo()
         updateMigratedCount()
     }
-
-    // MARK: - Setup
 
     private func setupVolumeMonitor(volumeName: String) {
         volumeMonitor = VolumeMonitor(
@@ -230,17 +210,12 @@ final class SidecarAppState: ObservableObject {
                 switch state {
                 case .mounted:
                     self.status = .active
-                    // Restore symlinks and merge any data written while disconnected.
                     self.disconnectGuard.onDriveReconnected()
                     try? self.directoryMonitor?.start()
-                    if self.config.preferences.runHealthCheckOnMount {
-                        self.runHealthCheck()
-                    }
+                    self.runHealthCheck()
                 case .missing:
                     self.status = .driveMissing
                     self.directoryMonitor?.stop()
-                    // Replace dead symlinks with placeholders and start
-                    // monitoring for migrated app launches.
                     self.disconnectGuard.onDriveDisconnected()
                 }
             }
@@ -275,33 +250,25 @@ final class SidecarAppState: ObservableObject {
     // MARK: - New App Detected
 
     private func handleNewApp(_ appURL: URL) async {
+        guard config.state.preferences.autoMigrateNewApps else { return }
         guard let volumeState = volumeMonitor?.state,
-              case .mounted(let volumePath) = volumeState else {
-            return
-        }
+              case .mounted(let volumePath) = volumeState else { return }
 
-        let footprint = await libraryScanner.scanFootprint(for: appURL)
-        let state = diskAnalyzer.currentDiskState()
-        let candidates = diskAnalyzer.prioritize(footprints: [footprint], diskState: state)
+        let result = libraryScanner.scanApp(appURL: appURL)
 
-        guard let candidate = candidates.first else { return }
+        guard !result.migratableItems.isEmpty else { return }
 
-        // Respect auto-migrate preference.
-        if config.preferences.autoMigrateNewApps {
-            let shouldProceed = await promptMigration(candidate: candidate)
-            guard shouldProceed else { return }
-        } else {
-            return  // Silent mode — user will run manual scans.
-        }
+        print("[Sidecar] New app detected: \(result.appName) (\(result.formattedMigratableSize) migratable)")
+
+        let shouldMigrate = await promptNewApp(result: result)
+        guard shouldMigrate else { return }
 
         do {
-            try await migrator.migrateLibraryData(
-                footprint: footprint,
+            try await migrator.migrateItems(
+                appName: result.appName,
+                bundleIdentifier: result.bundleIdentifier,
+                items: result.migratableItems,
                 externalBase: volumePath,
-                conflictHandler: { [weak self] url in
-                    guard let self else { return .skip }
-                    return await self.promptConflictResolution(for: url)
-                },
                 progressHandler: { progress in
                     print("[Sidecar] \(progress.phase): \(progress.detail)")
                 }
@@ -313,68 +280,56 @@ final class SidecarAppState: ObservableObject {
         }
     }
 
-    // MARK: - Full Scan (Manual)
+    // MARK: - Scan & Migrate (Manual)
 
-    func runFullScan() async {
+    func runScanAndMigrate() async {
         guard let volumeState = volumeMonitor?.state,
               case .mounted(let volumePath) = volumeState else { return }
 
         status = .scanning
 
-        let footprints = await libraryScanner.scanAllApps()
-        let state = diskAnalyzer.currentDiskState()
-        let candidates = diskAnalyzer.prioritize(footprints: footprints, diskState: state)
+        let results = await libraryScanner.scanAllApps()
 
-        // Debug logging
-        print("[Sidecar] Scan found \(footprints.count) third-party apps.")
-        for fp in footprints {
-            let libSize = fp.libraryItems.reduce(0) { $0 + $1.sizeBytes }
-            let libFormatted = ByteCountFormatter.string(fromByteCount: Int64(libSize), countStyle: .file)
-            print("[Sidecar]   \(fp.appBundleURL.lastPathComponent): \(fp.libraryItems.count) library items, \(libFormatted) library data")
-        }
-        print("[Sidecar] \(candidates.count) candidate(s) after scoring.")
-        for c in candidates {
-            print("[Sidecar]   \(c.footprint.appBundleURL.lastPathComponent): score=\(Int(c.score)), reclaimable=\(c.formattedReclaimable)")
+        print("[Sidecar] Scan found \(results.count) app(s) with migratable data:")
+        for r in results {
+            print("[Sidecar]   \(r.appName): \(r.migratableItems.count) items, \(r.formattedMigratableSize)")
+            for item in r.migratableItems {
+                print("[Sidecar]     \(item.displayName): \(item.formattedSize)")
+            }
         }
 
         status = .active
 
-        if candidates.isEmpty {
+        if results.isEmpty {
             showAlert(
                 title: "All Clear",
-                message: "No apps have Library data large enough to migrate (minimum 50 MB)."
+                message: "No apps have subdirectories large enough to migrate (minimum 10 MB per item, 50 MB per app)."
             )
             return
         }
 
-        // Show ALL candidates — user clicked Scan & Recommend, show what's available.
-        let totalReclaimable = candidates.reduce(0) { $0 + $1.reclaimableBytes }
-        let formatted = ByteCountFormatter.string(fromByteCount: Int64(totalReclaimable), countStyle: .file)
-        let appList = candidates
-            .map { "• \($0.footprint.appBundleURL.deletingPathExtension().lastPathComponent) (\($0.formattedReclaimable) Library data)" }
-            .joined(separator: "\n")
+        // Build per-item selection dialog.
+        let selectedItems = await promptItemSelection(results: results)
 
-        let proceed = await promptScanResults(
-            message: "Found \(candidates.count) app(s) with migratable Library data, totaling ~\(formatted):\n\n\(appList)"
-        )
+        guard !selectedItems.isEmpty else { return }
 
-        guard proceed else { return }
+        // Group selected items by app.
+        let grouped = Dictionary(grouping: selectedItems) { $0.parentAppName }
 
-        for candidate in candidates {
+        for (appName, items) in grouped {
+            let bundleID = items.first?.bundleIdentifier
             do {
-                try await migrator.migrateLibraryData(
-                    footprint: candidate.footprint,
+                try await migrator.migrateItems(
+                    appName: appName,
+                    bundleIdentifier: bundleID,
+                    items: items,
                     externalBase: volumePath,
-                    conflictHandler: { [weak self] url in
-                        guard let self else { return .skip }
-                        return await self.promptConflictResolution(for: url)
-                    },
                     progressHandler: { progress in
                         print("[Sidecar] \(progress.phase): \(progress.detail)")
                     }
                 )
             } catch {
-                print("[Sidecar] Failed: \(candidate.footprint.appBundleURL.lastPathComponent): \(error)")
+                print("[Sidecar] Failed: \(appName): \(error)")
             }
         }
 
@@ -386,30 +341,12 @@ final class SidecarAppState: ObservableObject {
 
     func runHealthCheck() {
         let issues = manifest.healthCheck()
-
         if issues.isEmpty {
             print("[Sidecar] Health check: all migrations healthy.")
             return
         }
-
         for issue in issues {
-            switch issue.type {
-            case .symlinkMissing:
-                print("[Sidecar] ⚠️ \(issue.appName): symlink missing.")
-            case .targetUnreachable:
-                print("[Sidecar] ⚠️ \(issue.appName): target unreachable.")
-            case .updaterReplacedSymlink:
-                print("[Sidecar] ⚠️ \(issue.appName): updater replaced symlink.")
-            }
-        }
-
-        let nuked = issues.filter { $0.type == .updaterReplacedSymlink }
-        if !nuked.isEmpty {
-            let names = nuked.map(\.appName).joined(separator: ", ")
-            showAlert(
-                title: "App Updates Detected",
-                message: "\(names) replaced their symlink(s) during an update. They may need re-migration."
-            )
+            print("[Sidecar] ⚠️ \(issue.appName): \(issue.type) at \(issue.itemPath)")
         }
     }
 
@@ -422,60 +359,32 @@ final class SidecarAppState: ObservableObject {
 
     private func updateMigratedCount() {
         let count = manifest.activeRecords.count
-        migratedCountLabel = count > 0 ? "\(count) app(s) migrated" : nil
+        migratedCountLabel = count > 0 ? "\(count) app(s) with migrated data" : nil
     }
 
     // MARK: - Dialogs
 
-    private func promptMigration(candidate: DiskAnalyzer.MigrationCandidate) async -> Bool {
+    private func promptNewApp(result: LibraryScanner.AppScanResult) async -> Bool {
         await withCheckedContinuation { continuation in
-            let appName = candidate.footprint.appBundleURL.deletingPathExtension().lastPathComponent
-            let libCount = candidate.footprint.libraryItems.count
             let alert = NSAlert()
-            alert.messageText = "Migrate \(appName) Library data?"
+            alert.messageText = "Migrate \(result.appName) data to external drive?"
             alert.informativeText = """
-                App stays in /Applications (untouched).
-                Library data to move: \(libCount) folder(s)
-                Space reclaimable: ~\(candidate.formattedReclaimable)
-                \(candidate.reasoning)
+                Found \(result.migratableItems.count) heavy folder(s) totaling \(result.formattedMigratableSize).
+                The app itself stays in /Applications — only data folders move.
+                The app will work normally with or without the drive connected.
                 """
             alert.alertStyle = .informational
-            alert.addButton(withTitle: "Migrate Data")
+            alert.addButton(withTitle: "Migrate")
             alert.addButton(withTitle: "Skip")
             continuation.resume(returning: alert.runModal() == .alertFirstButtonReturn)
         }
     }
 
-    private func promptScanResults(message: String) async -> Bool {
-        await withCheckedContinuation { continuation in
-            let alert = NSAlert()
-            alert.messageText = "Migration Recommendations"
-            alert.informativeText = message
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "Migrate All")
-            alert.addButton(withTitle: "Cancel")
-            continuation.resume(returning: alert.runModal() == .alertFirstButtonReturn)
-        }
-    }
-
-    private func promptConflictResolution(
-        for existingURL: URL
-    ) async -> AppMigrator.ConflictResolution {
-        await withCheckedContinuation { continuation in
-            let alert = NSAlert()
-            alert.messageText = "App Already Exists"
-            alert.informativeText = "\"\(existingURL.lastPathComponent)\" already exists on the external drive."
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "Overwrite")
-            alert.addButton(withTitle: "Link Only")
-            alert.addButton(withTitle: "Skip")
-
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:  continuation.resume(returning: .overwrite)
-            case .alertSecondButtonReturn: continuation.resume(returning: .linkOnly)
-            default:                       continuation.resume(returning: .skip)
-            }
-        }
+    /// Show a checklist of all migratable items across all apps.
+    private func promptItemSelection(
+        results: [LibraryScanner.AppScanResult]
+    ) async -> [LibraryScanner.MigratableItem] {
+        await showMigrationPicker(results: results)
     }
 
     private func showAlert(title: String, message: String) {

@@ -1,171 +1,104 @@
 # Project Sidecar
 
-> **Keep your Mac's internal drive clean.** Automatically migrate third-party applications and their Library data to an external USB4 volume using symbolic links.
-
-<p align="center">
-  <img src="docs/assets/menu-bar-preview.png" alt="Menu Bar Preview" width="280" />
-</p>
+> **Keep your Mac's internal drive clean.** Automatically find and move heavy app data subdirectories to an external drive using symbolic links — apps keep working normally.
 
 ---
 
 ## The Problem
 
-You bought a MacBook with a 256GB or 512GB drive. After macOS, Xcode, Docker, a few creative apps, and their associated Library data — you're already running low. Apps like Adobe Creative Cloud, Logic Pro, or Docker Desktop can consume 10-50GB+ each once you count their `~/Library` footprint.
+macOS apps store huge amounts of data in `~/Library` — caches, VM bundles, indexes, blobs. Claude Desktop alone stores 12GB+ of VM bundles. These eat your internal drive while the app bundles themselves are relatively small.
 
 ## The Solution
 
-**Sidecar** monitors `/Applications` for new installs, scans their *full disk footprint* (the `.app` bundle + associated `~/Library` data), and migrates them to an external USB4 drive — replacing originals with symlinks so everything still works transparently.
+Sidecar scans **inside** each app's Library folders for heavy subdirectories and moves them to an external drive, replacing them with symlinks. The parent folder stays real — apps don't notice the difference.
+
+```
+~/Library/Application Support/Claude/          ← stays real (local)
+~/Library/Application Support/Claude/vm_bundles → /Volumes/ExtDrive/Library/Claude/vm_bundles (12GB)
+~/Library/Application Support/Claude/Cache      → /Volumes/ExtDrive/Library/Claude/Cache (146MB)
+~/Library/Application Support/Claude/config.json ← stays real (tiny, local)
+```
+
+## Why Sub-Directory Symlinks?
+
+We tested three approaches before landing on this one:
+
+| Approach | Result |
+|----------|--------|
+| Symlink entire `.app` bundle to external | ❌ macOS Launch Services blocks it (error -10657) |
+| Symlink entire `Application Support/AppName` folder | ❌ Electron/Chromium apps reject it (sandbox check) |
+| Symlink heavy subdirectories **inside** the folder | ✅ Apps work perfectly, even when drive is disconnected |
 
 ## Features
 
-### 🧭 First-Run Setup Wizard
-- Detects external drives automatically
-- Validates filesystem compatibility (APFS / HFS+ required)
-- Checks Full Disk Access permissions
-- Scans existing apps and recommends what to migrate
+### Intelligent Deep Scanning
+Scans inside `~/Library/Application Support/{app}/` for heavy subdirectories (>10MB). Also scans `~/Library/Caches/` and `~/Library/Logs/` for top-level app folders.
 
-### 📦 Library-Only Migration (v0.2)
-macOS Launch Services blocks apps launched via symlinks to external drives. So Sidecar takes the smarter approach: **the .app bundle stays in /Applications** while the Library data — where the real disk space lives — gets moved to the external drive and symlinked.
+### Graceful Disconnect Handling
+When the external drive is unplugged:
+- Dead symlinks are replaced with empty placeholder directories
+- Apps launch normally (minus the migrated data)
+- When the drive reconnects, symlinks are restored and any locally-written data is merged back
 
-Not just the `.app` bundle — Sidecar scans **9 Library directories** per app:
+### Menu Bar App
+- Shows drive status (Active / Missing)
+- Internal drive usage stats
+- Scan & Migrate with per-item details
+- Health check for broken symlinks
 
-| Directory | Typical Contents | Symlink Safe? |
-|-----------|-----------------|:---:|
-| `Application Support` | Plugins, databases, configs | ✅ |
-| `Containers` | Sandboxed app data | ⚠️ Copy only |
-| `Group Containers` | Shared sandboxed data | ⚠️ Copy only |
-| `Caches` | Regenerable cache data | ✅ |
-| `Preferences` | `.plist` settings | ✅ |
-| `Saved Application State` | Window positions, state | ✅ |
-| `Logs` | App logs | ✅ |
-| `HTTPStorages` | Cookie/session data | ✅ |
-| `WebKit` | WebKit storage | ✅ |
-
-### 📊 Smart Prioritization
-- Scores apps 0-100 based on total footprint, library-to-bundle ratio, and disk pressure
-- Generates migration plans that target a specific free-space goal
-- Apps under 50MB are ignored (not worth the symlink complexity)
-- Disk pressure multiplier: more aggressive when your drive is nearly full
-
-### 🔁 Rollback & Health Monitoring
-- Every migration is recorded in a JSON manifest
-- Full undo: moves everything back, removes symlinks
-- Detects broken symlinks (drive disconnected)
-- Detects when app updaters nuke symlinks and replace them with real files
-
-### 🖥 Menu Bar App
-- Status indicator: Active / Idle / Drive Missing / Scanning
-- Shows disk usage and migrated app count
-- Quick access to scan, health check, and settings
+### Migration Safety
+- Every migration recorded in a JSON manifest for rollback
+- Health checks detect broken or replaced symlinks
+- Self-protection: Sidecar never migrates itself
 
 ## Requirements
 
 - **macOS 14+** (Sonoma, Sequoia, or later)
-- **External USB4/Thunderbolt drive** formatted as APFS or Mac OS Extended (HFS+)
-- **Full Disk Access** permission (prompted during setup)
+- **External USB4/Thunderbolt drive** formatted as APFS or HFS+
 
-## Building
+## Quick Start
 
 ```bash
-# Clone the repo
-git clone https://github.com/YOUR_USERNAME/project-sidecar.git
-cd project-sidecar
-
-# Build
+git clone https://github.com/sofa-king-secure/sidecar.git
+cd sidecar
 swift build
-
-# Run tests
-swift test
-
-# Build for release
-swift build -c release
+./install.sh           # Builds .app, installs to /Applications
+open /Applications/Sidecar.app
 ```
 
 ## Project Structure
 
 ```
-ProjectSidecar/
-├── Package.swift                 # Swift Package Manager manifest
-├── Sources/ProjectSidecar/
-│   ├── main.swift                # App entry point, menu bar, state management
-│   ├── OnboardingView.swift      # First-run setup wizard (SwiftUI)
-│   ├── SidecarConfig.swift       # Persistent configuration & preferences
-│   ├── DriveSetup.swift          # External volume discovery & validation
-│   ├── DirectoryMonitor.swift    # FSEvents watcher for /Applications
-│   ├── AppFilter.swift           # Excludes Apple/system apps
-│   ├── LibraryScanner.swift      # Discovers ~/Library data per app
-│   ├── DiskAnalyzer.swift        # Size-based scoring & prioritization
-│   ├── AppMigrator.swift         # File move + symlink creation
-│   ├── MigrationManifest.swift   # Rollback tracking & health checks
-│   └── VolumeMonitor.swift       # External drive mount/unmount detection
-├── Tests/ProjectSidecarTests/
-│   └── ProjectSidecarTests.swift # Unit tests
-├── docs/
-│   └── ARCHITECTURE.md           # Detailed architecture documentation
-├── CLAUDE.md                     # AI/dev pair-programming instructions
-├── PRD.md                        # Product requirements
-├── TECH_SPECS.md                 # Technical specifications
-├── LICENSE                       # MIT License
-└── CONTRIBUTING.md               # Contribution guidelines
+Sources/ProjectSidecar/
+├── SidecarApp.swift          # App entry, menu bar, state management
+├── OnboardingView.swift      # First-run setup wizard
+├── LibraryScanner.swift      # Deep scans inside Library folders
+├── AppMigrator.swift         # Moves subdirectories + creates symlinks
+├── DisconnectGuard.swift     # Handles drive disconnect/reconnect safely
+├── MigrationManifest.swift   # Tracks migrations for rollback
+├── DirectoryMonitor.swift    # FSEvents watcher for /Applications
+├── AppFilter.swift           # Excludes Apple/system apps + self
+├── VolumeMonitor.swift       # External drive mount/unmount detection
+├── DriveSetup.swift          # Drive discovery and validation
+├── SidecarConfig.swift       # Persistent configuration
+└── DiskAnalyzer.swift        # Disk state reporting
 ```
 
 ## How It Works
 
-```
-┌─────────────┐     ┌──────────┐     ┌─────────────────┐
-│  /Applications │──▶│ FSEvents │──▶│ DirectoryMonitor │
-│  (new .app)    │   │ stream   │   │                   │
-└─────────────┘     └──────────┘   └────────┬──────────┘
-                                             │
-                                    ┌────────▼──────────┐
-                                    │    AppFilter       │
-                                    │ (skip Apple apps)  │
-                                    └────────┬──────────┘
-                                             │
-                                    ┌────────▼──────────┐
-                                    │  LibraryScanner    │
-                                    │ (full footprint)   │
-                                    └────────┬──────────┘
-                                             │
-                                    ┌────────▼──────────┐
-                                    │   DiskAnalyzer     │
-                                    │ (score & plan)     │
-                                    └────────┬──────────┘
-                                             │
-                                    ┌────────▼──────────┐
-                                    │   AppMigrator      │──▶ External Drive
-                                    │ (move + symlink)   │    /Volumes/Drive/
-                                    └────────┬──────────┘
-                                             │
-                                    ┌────────▼──────────┐
-                                    │ MigrationManifest  │
-                                    │ (record + rollback)│
-                                    └───────────────────┘
-```
+1. **Scan** — For each third-party app, look inside its `~/Library/Application Support/` folder for subdirectories larger than 10MB
+2. **Prompt** — Show the user what was found with sizes
+3. **Move** — `FileManager.moveItem` each heavy subdirectory to the external drive
+4. **Symlink** — `FileManager.createSymbolicLink` at the original location pointing to the external copy
+5. **Record** — Save to manifest for rollback and health checks
+6. **Guard** — On drive disconnect, replace dead symlinks with empty placeholders
 
-## Configuration
+## Proven Results
 
-Settings are stored in `~/Library/Application Support/ProjectSidecar/config.json`.
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `autoMigrateNewApps` | `true` | Prompt when new apps are installed |
-| `minimumAppSizeMB` | `50` | Skip apps smaller than this |
-| `targetFreeSpaceGB` | `30` | Target free space on internal drive |
-| `migrateLibraryData` | `true` | Also migrate ~/Library folders |
-| `migrateCaches` | `false` | Include Caches (they regenerate) |
-| `runHealthCheckOnMount` | `true` | Check symlinks when drive reconnects |
-| `launchAtLogin` | `false` | Start Sidecar at login |
-
-## Roadmap
-
-- [ ] Settings UI panel (volume selection, thresholds)
-- [ ] LaunchAgent plist generation for login start
-- [ ] Periodic container sync for sandboxed apps
-- [ ] Notifications via UserNotifications framework
-- [ ] Homebrew formula
-- [ ] Disk usage dashboard in menu bar popover
-- [ ] Multiple drive support
+| App | Item | Size | Works Without Drive? |
+|-----|------|------|---------------------|
+| Claude Desktop | vm_bundles | 12 GB | ✅ Yes (chat works, Code VM unavailable) |
+| Firefox | Caches | 890 MB | ✅ Yes (rebuilds cache) |
 
 ## License
 

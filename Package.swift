@@ -10,7 +10,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ProjectSidecar",
-            path: "Sources/ProjectSidecar"
+            path: "Sources/ProjectSidecar",
+            swiftSettings: [
+                .unsafeFlags(["-parse-as-library"])
+            ]
         ),
         .testTarget(
             name: "ProjectSidecarTests",

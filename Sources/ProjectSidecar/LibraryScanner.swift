@@ -1,103 +1,73 @@
 import Foundation
 
-/// Scans `~/Library` and related directories to discover all data folders
-/// belonging to a given application. This is the key to actually freeing
-/// disk space — the .app bundle is often a fraction of total footprint.
+/// Scans ~/Library to discover heavy subdirectories belonging to apps.
 ///
-/// Targets (per macOS conventions):
-///   ~/Library/Application Support/{bundleID or appName}
-///   ~/Library/Caches/{bundleID}
-///   ~/Library/Containers/{bundleID}
-///   ~/Library/Group Containers/*.{bundleID component}
-///   ~/Library/Preferences/{bundleID}.plist
-///   ~/Library/Saved Application State/{bundleID}.savedState
-///   ~/Library/Logs/{bundleID or appName}
-///   ~/Library/HTTPStorages/{bundleID}
-///   ~/Library/WebKit/{bundleID}
+/// KEY INSIGHT (v0.3):
+///   Moving entire ~/Library/Application Support/{app} folders breaks
+///   Electron apps (and likely others) because they check the real path
+///   of their support directory. Instead, we scan INSIDE those folders
+///   for heavy subdirectories (caches, blobs, VMs, indexes) and symlink
+///   those individually. The parent folder stays real.
 ///
-/// All discovery uses native FileManager — no shell calls per CLAUDE.md.
+///   Example: ~/Library/Application Support/Claude/ stays real
+///            ~/Library/Application Support/Claude/vm_bundles → external (12GB)
+///            ~/Library/Application Support/Claude/Cache → external (146MB)
+///
+/// Also scans ~/Library/Caches/{bundleID} (safe to symlink entirely).
 struct LibraryScanner {
 
     // MARK: - Types
 
-    /// A discovered library data folder and its role.
-    struct LibraryItem: Sendable, Identifiable {
-        let id: String          // Composite key: "{category}:{path}"
+    /// A single item (file or directory) that can be migrated.
+    struct MigratableItem: Sendable, Identifiable {
+        let id: String
         let url: URL
-        let category: Category
-        let sizeBytes: UInt64
-
-        /// How important this data is — affects migration strategy.
-        enum Category: String, Sendable, CaseIterable, Comparable {
-            case applicationSupport = "Application Support"
-            case containers         = "Containers"
-            case groupContainers    = "Group Containers"
-            case caches             = "Caches"
-            case preferences        = "Preferences"
-            case savedState         = "Saved Application State"
-            case logs               = "Logs"
-            case httpStorages       = "HTTPStorages"
-            case webKit             = "WebKit"
-
-            /// Rough priority: higher = more important to migrate for space.
-            var migrationPriority: Int {
-                switch self {
-                case .containers:         return 100  // Often huge (sandboxed app data)
-                case .applicationSupport: return 90   // Plugins, caches, databases
-                case .groupContainers:    return 80
-                case .caches:             return 70   // Can be large but regenerable
-                case .webKit:             return 50
-                case .httpStorages:       return 40
-                case .savedState:         return 30
-                case .logs:               return 20
-                case .preferences:        return 10   // Tiny plists, rarely worth moving
-                }
-            }
-
-            /// Whether this category is safe to symlink. Some categories
-            /// cause issues when symlinked (sandboxed containers).
-            var symlinkSafe: Bool {
-                switch self {
-                case .containers, .groupContainers:
-                    return false  // Sandboxed apps may reject symlinked containers.
-                default:
-                    return true
-                }
-            }
-
-            static func < (lhs: Self, rhs: Self) -> Bool {
-                lhs.migrationPriority < rhs.migrationPriority
-            }
-        }
-    }
-
-    /// Complete footprint of an app across the system.
-    struct AppFootprint: Sendable {
+        let parentAppName: String
         let bundleIdentifier: String?
-        let appBundleURL: URL
-        let appBundleSize: UInt64
-        let libraryItems: [LibraryItem]
+        let sizeBytes: UInt64
+        let depth: ItemDepth
+        let isAlreadySymlinked: Bool
 
-        /// Total bytes across app bundle + all library data.
-        var totalSize: UInt64 {
-            appBundleSize + libraryItems.reduce(0) { $0 + $1.sizeBytes }
+        /// Whether this is a top-level Library folder or a subdirectory inside one.
+        enum ItemDepth: String, Sendable {
+            case topLevel       // e.g., ~/Library/Caches/Firefox (safe to symlink whole thing)
+            case subDirectory   // e.g., ~/Library/Application Support/Claude/vm_bundles
         }
 
-        /// Only the items that are safe to symlink.
-        var symlinkableItems: [LibraryItem] {
-            libraryItems.filter { $0.category.symlinkSafe }
+        var formattedSize: String {
+            ByteCountFormatter.string(fromByteCount: Int64(sizeBytes), countStyle: .file)
         }
 
-        /// Items that need special handling (copy + periodic sync, not symlink).
-        var unsafeItems: [LibraryItem] {
-            libraryItems.filter { !$0.category.symlinkSafe }
-        }
-
-        /// Human-readable size.
-        var formattedTotalSize: String {
-            ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file)
+        var displayName: String {
+            let parent = url.deletingLastPathComponent().lastPathComponent
+            return "\(parent)/\(url.lastPathComponent)"
         }
     }
+
+    /// Complete scan results for an app.
+    struct AppScanResult: Sendable, Identifiable {
+        let id: String  // Bundle ID or app name
+        let appName: String
+        let bundleIdentifier: String?
+        let appBundleSize: UInt64
+        let migratableItems: [MigratableItem]
+
+        var totalMigratableSize: UInt64 {
+            migratableItems.reduce(0) { $0 + $1.sizeBytes }
+        }
+
+        var formattedMigratableSize: String {
+            ByteCountFormatter.string(fromByteCount: Int64(totalMigratableSize), countStyle: .file)
+        }
+    }
+
+    // MARK: - Configuration
+
+    /// Minimum size for a subdirectory to be worth migrating.
+    var minimumSubdirSize: UInt64 = 10_000_000  // 10 MB
+
+    /// Minimum total migratable size for an app to show up as a candidate.
+    var minimumAppMigratableSize: UInt64 = 50_000_000  // 50 MB
 
     // MARK: - Properties
 
@@ -111,43 +81,68 @@ struct LibraryScanner {
 
     // MARK: - Public API
 
-    /// Scan the full disk footprint for an app.
-    func scanFootprint(for appURL: URL) async -> AppFootprint {
+    /// Scan a single app for migratable subdirectories.
+    func scanApp(appURL: URL) -> AppScanResult {
         let bundleID = readBundleIdentifier(from: appURL)
         let appName = appURL.deletingPathExtension().lastPathComponent
 
-        // Gather search terms: bundle ID and app name.
-        var searchTerms: [String] = []
-        if let bid = bundleID { searchTerms.append(bid) }
-        searchTerms.append(appName)
-
-        // Scan each library subdirectory.
-        var items: [LibraryItem] = []
-
-        for category in LibraryItem.Category.allCases {
-            let discovered = scanCategory(category, searchTerms: searchTerms, bundleID: bundleID)
-            items.append(contentsOf: discovered)
+        var searchTerms: [String] = [appName]
+        if let bid = bundleID {
+            searchTerms.append(bid)
+            let parts = bid.split(separator: ".")
+            if parts.count >= 2 {
+                searchTerms.append(String(parts.last!))
+            }
         }
 
-        // De-duplicate by path.
+        var items: [MigratableItem] = []
+
+        // 1. Deep scan Application Support — look INSIDE matching folders
+        items.append(contentsOf: deepScanApplicationSupport(
+            appName: appName,
+            bundleID: bundleID,
+            searchTerms: searchTerms
+        ))
+
+        // 2. Top-level scan Caches — these are safe to symlink entirely
+        items.append(contentsOf: scanTopLevel(
+            category: "Caches",
+            appName: appName,
+            bundleID: bundleID,
+            searchTerms: searchTerms
+        ))
+
+        // 3. Top-level scan Logs
+        items.append(contentsOf: scanTopLevel(
+            category: "Logs",
+            appName: appName,
+            bundleID: bundleID,
+            searchTerms: searchTerms
+        ))
+
+        // De-duplicate by path
         var seen = Set<String>()
         items = items.filter { seen.insert($0.url.path).inserted }
 
-        // Sort by size descending — biggest offenders first.
+        // Filter out tiny items and already-symlinked items
+        items = items.filter { $0.sizeBytes >= minimumSubdirSize && !$0.isAlreadySymlinked }
+
+        // Sort by size descending
         items.sort { $0.sizeBytes > $1.sizeBytes }
 
         let appSize = directorySize(at: appURL)
 
-        return AppFootprint(
+        return AppScanResult(
+            id: bundleID ?? appName,
+            appName: appName,
             bundleIdentifier: bundleID,
-            appBundleURL: appURL,
             appBundleSize: appSize,
-            libraryItems: items
+            migratableItems: items
         )
     }
 
-    /// Batch scan: analyze all third-party apps and return sorted by total footprint.
-    func scanAllApps(in applicationsDir: String = "/Applications") async -> [AppFootprint] {
+    /// Scan all third-party apps.
+    func scanAllApps(in applicationsDir: String = "/Applications") async -> [AppScanResult] {
         let filter = AppFilter()
         let fm = FileManager.default
 
@@ -155,140 +150,154 @@ struct LibraryScanner {
             return []
         }
 
-        var footprints: [AppFootprint] = []
+        var results: [AppScanResult] = []
 
         for item in contents where item.hasSuffix(".app") {
             let appURL = URL(fileURLWithPath: applicationsDir)
                 .appendingPathComponent(item)
 
-            // Skip system apps.
-            guard (try? await filter.shouldProcess(appURL: appURL)) == true else {
-                continue
-            }
+            // Skip system apps and symlinks.
+            guard (try? await filter.shouldProcess(appURL: appURL)) == true else { continue }
 
-            // Skip items that are already symlinks (already migrated).
-            var isSymlink: Bool {
-                let resourceValues = try? appURL.resourceValues(forKeys: [.isSymbolicLinkKey])
-                return resourceValues?.isSymbolicLink ?? false
-            }
-            guard !isSymlink else { continue }
+            let resourceValues = try? appURL.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if resourceValues?.isSymbolicLink == true { continue }
 
-            let footprint = await scanFootprint(for: appURL)
-            footprints.append(footprint)
+            let result = scanApp(appURL: appURL)
+
+            // Only include apps with enough migratable data.
+            if result.totalMigratableSize >= minimumAppMigratableSize {
+                results.append(result)
+            }
         }
 
-        // Sort biggest first — these are the migration candidates.
-        footprints.sort { $0.totalSize > $1.totalSize }
-        return footprints
+        results.sort { $0.totalMigratableSize > $1.totalMigratableSize }
+        return results
     }
 
-    // MARK: - Category Scanning
+    // MARK: - Deep Scan (Inside Application Support)
 
-    private func scanCategory(
-        _ category: LibraryItem.Category,
-        searchTerms: [String],
-        bundleID: String?
-    ) -> [LibraryItem] {
-        let categoryDir = homeLibrary.appendingPathComponent(category.rawValue)
+    /// Scan INSIDE ~/Library/Application Support/{appName} for heavy subdirectories.
+    /// The parent folder stays — only subdirectories get symlinked.
+    private func deepScanApplicationSupport(
+        appName: String,
+        bundleID: String?,
+        searchTerms: [String]
+    ) -> [MigratableItem] {
+        let appSupportDir = homeLibrary.appendingPathComponent("Application Support")
+        guard fileManager.fileExists(atPath: appSupportDir.path) else { return [] }
 
-        guard fileManager.fileExists(atPath: categoryDir.path) else { return [] }
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: appSupportDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
 
-        // Preferences are individual .plist files, not directories.
-        if category == .preferences {
-            return scanPreferences(searchTerms: searchTerms, bundleID: bundleID)
+        var items: [MigratableItem] = []
+
+        for folderURL in contents {
+            let name = folderURL.lastPathComponent
+
+            // Check if this folder belongs to the app.
+            let matches = searchTerms.contains { term in
+                name.localizedCaseInsensitiveContains(term)
+            }
+            guard matches else { continue }
+
+            // Don't scan inside if the whole folder is already a symlink.
+            if isSymlink(at: folderURL) { continue }
+
+            // Scan subdirectories INSIDE this folder.
+            guard let subContents = try? fileManager.contentsOfDirectory(
+                at: folderURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+
+            for subURL in subContents {
+                var isDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: subURL.path, isDirectory: &isDir),
+                      isDir.boolValue else { continue }
+
+                let alreadyLinked = isSymlink(at: subURL)
+                let size = alreadyLinked ? 0 : directorySize(at: subURL)
+
+                items.append(MigratableItem(
+                    id: "AppSupport:\(name)/\(subURL.lastPathComponent)",
+                    url: subURL,
+                    parentAppName: appName,
+                    bundleIdentifier: bundleID,
+                    sizeBytes: size,
+                    depth: .subDirectory,
+                    isAlreadySymlinked: alreadyLinked
+                ))
+            }
         }
+
+        return items
+    }
+
+    // MARK: - Top-Level Scan (Caches, Logs)
+
+    /// Scan for top-level folders in a Library category that match the app.
+    /// These are safe to symlink entirely (Caches regenerate, Logs are expendable).
+    private func scanTopLevel(
+        category: String,
+        appName: String,
+        bundleID: String?,
+        searchTerms: [String]
+    ) -> [MigratableItem] {
+        let categoryDir = homeLibrary.appendingPathComponent(category)
+        guard fileManager.fileExists(atPath: categoryDir.path) else { return [] }
 
         guard let contents = try? fileManager.contentsOfDirectory(
             at: categoryDir,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
+        ) else { return [] }
 
-        var results: [LibraryItem] = []
+        var items: [MigratableItem] = []
 
         for itemURL in contents {
             let name = itemURL.lastPathComponent
-
-            let matches: Bool = {
-                for term in searchTerms {
-                    // Exact match or contains (case-insensitive).
-                    if name.localizedCaseInsensitiveContains(term) {
-                        return true
-                    }
-                    // Group Containers use format: "*.{bundleID-component}"
-                    if category == .groupContainers,
-                       let bid = bundleID,
-                       let teamGroup = bid.split(separator: ".").last,
-                       name.contains(String(teamGroup)) {
-                        return true
-                    }
-                }
-                return false
-            }()
-
-            if matches {
-                let size = directorySize(at: itemURL)
-                let item = LibraryItem(
-                    id: "\(category.rawValue):\(itemURL.path)",
-                    url: itemURL,
-                    category: category,
-                    sizeBytes: size
-                )
-                results.append(item)
+            let matches = searchTerms.contains { term in
+                name.localizedCaseInsensitiveContains(term)
             }
+            guard matches else { continue }
+
+            let alreadyLinked = isSymlink(at: itemURL)
+            let size = alreadyLinked ? 0 : directorySize(at: itemURL)
+
+            items.append(MigratableItem(
+                id: "\(category):\(name)",
+                url: itemURL,
+                parentAppName: appName,
+                bundleIdentifier: bundleID,
+                sizeBytes: size,
+                depth: .topLevel,
+                isAlreadySymlinked: alreadyLinked
+            ))
         }
 
-        return results
-    }
-
-    private func scanPreferences(searchTerms: [String], bundleID: String?) -> [LibraryItem] {
-        let prefsDir = homeLibrary.appendingPathComponent("Preferences")
-        guard let contents = try? fileManager.contentsOfDirectory(
-            at: prefsDir,
-            includingPropertiesForKeys: [.fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-
-        var results: [LibraryItem] = []
-
-        for fileURL in contents where fileURL.pathExtension == "plist" {
-            let name = fileURL.deletingPathExtension().lastPathComponent
-
-            for term in searchTerms {
-                if name.localizedCaseInsensitiveContains(term) {
-                    let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                        .flatMap { UInt64($0) } ?? 0
-                    results.append(LibraryItem(
-                        id: "Preferences:\(fileURL.path)",
-                        url: fileURL,
-                        category: .preferences,
-                        sizeBytes: size
-                    ))
-                    break
-                }
-            }
-        }
-
-        return results
+        return items
     }
 
     // MARK: - Helpers
 
-    /// Recursively compute directory size using native API.
+    private func isSymlink(at url: URL) -> Bool {
+        let resourceValues = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
+        return resourceValues?.isSymbolicLink ?? false
+    }
+
     private func directorySize(at url: URL) -> UInt64 {
         guard let enumerator = fileManager.enumerator(
             at: url,
             includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles],
+            options: [],
             errorHandler: nil
         ) else {
-            // Single file?
             return (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize)
                 .flatMap { UInt64($0) } ?? 0
         }
-
         var total: UInt64 = 0
         for case let fileURL as URL in enumerator {
             guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
