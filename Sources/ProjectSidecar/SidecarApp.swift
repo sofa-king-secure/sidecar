@@ -43,8 +43,8 @@ struct ProjectSidecarApp: App {
             }
             .disabled(appState.status == .driveMissing)
 
-            Button("Health Check") {
-                appState.runHealthCheck()
+            Button("View Status & Health...") {
+                appState.showStatus()
             }
 
             Divider()
@@ -82,7 +82,10 @@ final class SidecarAppState: ObservableObject {
         didSet { SidecarConfig.shared.updatePreferences { $0.autoMigrateNewApps = autoMigrate } }
     }
     @Published var launchAtLogin: Bool {
-        didSet { SidecarConfig.shared.updatePreferences { $0.launchAtLogin = launchAtLogin } }
+        didSet {
+            SidecarConfig.shared.updatePreferences { $0.launchAtLogin = launchAtLogin }
+            updateLaunchAgent(enabled: launchAtLogin)
+        }
     }
 
     enum Status {
@@ -337,7 +340,28 @@ final class SidecarAppState: ObservableObject {
         updateDiskInfo()
     }
 
-    // MARK: - Health Check
+    // MARK: - Status & Health Check
+
+    func showStatus() {
+        let driveConnected: Bool
+        let driveName: String
+
+        if case .mounted = volumeMonitor?.state {
+            driveConnected = true
+        } else {
+            driveConnected = false
+        }
+        driveName = config.configuredVolumeName ?? "Unknown"
+
+        let diskState = diskAnalyzer.currentDiskState()
+
+        showStatusWindow(
+            manifest: manifest,
+            driveName: driveName,
+            driveConnected: driveConnected,
+            diskState: diskState
+        )
+    }
 
     func runHealthCheck() {
         let issues = manifest.healthCheck()
@@ -393,5 +417,59 @@ final class SidecarAppState: ObservableObject {
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+
+    // MARK: - Launch at Login
+
+    private func updateLaunchAgent(enabled: Bool) {
+        let bundleID = "com.projectsidecar.app"
+        let launchAgentDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents")
+        let plistPath = launchAgentDir.appendingPathComponent("\(bundleID).plist")
+        let appPath = "/Applications/Sidecar.app/Contents/MacOS/Sidecar"
+        let logDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/ProjectSidecar")
+
+        if enabled {
+            // Create LaunchAgent plist
+            try? FileManager.default.createDirectory(at: launchAgentDir, withIntermediateDirectories: true)
+            try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+
+            let plist: [String: Any] = [
+                "Label": bundleID,
+                "ProgramArguments": [appPath],
+                "RunAtLoad": true,
+                "KeepAlive": false,
+                "ProcessType": "Interactive",
+                "StandardOutPath": logDir.appendingPathComponent("sidecar.log").path,
+                "StandardErrorPath": logDir.appendingPathComponent("sidecar-error.log").path
+            ]
+
+            let data = try? PropertyListSerialization.data(
+                fromPropertyList: plist, format: .xml, options: 0
+            )
+            try? data?.write(to: plistPath)
+
+            // Load it
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            process.arguments = ["load", plistPath.path]
+            try? process.run()
+            process.waitUntilExit()
+
+            print("[Sidecar] ✅ Launch at Login enabled.")
+        } else {
+            // Unload and remove
+            if FileManager.default.fileExists(atPath: plistPath.path) {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                process.arguments = ["unload", plistPath.path]
+                try? process.run()
+                process.waitUntilExit()
+
+                try? FileManager.default.removeItem(at: plistPath)
+            }
+            print("[Sidecar] Launch at Login disabled.")
+        }
     }
 }

@@ -4,19 +4,19 @@
 # Usage:
 #   chmod +x build-app.sh
 #   ./build-app.sh
-#
-# Output: build/Sidecar.app (double-click to run, drag to /Applications)
 
 set -e
 
 APP_NAME="Sidecar"
 BUNDLE_ID="com.projectsidecar.app"
-VERSION="0.1.0"
+VERSION="0.3.0"
 BUILD_DIR="build"
 APP_DIR="${BUILD_DIR}/${APP_NAME}.app"
 CONTENTS="${APP_DIR}/Contents"
 MACOS="${CONTENTS}/MacOS"
 RESOURCES="${CONTENTS}/Resources"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ICON_SOURCE="${SCRIPT_DIR}/Resources/AppIcon.png"
 
 echo "🔨 Building release binary..."
 swift build -c release
@@ -36,6 +36,36 @@ mkdir -p "${MACOS}" "${RESOURCES}"
 
 # Copy binary
 cp "${BINARY}" "${MACOS}/${APP_NAME}"
+
+# Create app icon from PNG if source exists
+if [ -f "${ICON_SOURCE}" ]; then
+    echo "🎨 Creating app icon..."
+    ICONSET="${BUILD_DIR}/AppIcon.iconset"
+    rm -rf "${ICONSET}"
+    mkdir -p "${ICONSET}"
+
+    # Generate all required icon sizes
+    sips -z 16 16     "${ICON_SOURCE}" --out "${ICONSET}/icon_16x16.png"      > /dev/null 2>&1
+    sips -z 32 32     "${ICON_SOURCE}" --out "${ICONSET}/icon_16x16@2x.png"   > /dev/null 2>&1
+    sips -z 32 32     "${ICON_SOURCE}" --out "${ICONSET}/icon_32x32.png"      > /dev/null 2>&1
+    sips -z 64 64     "${ICON_SOURCE}" --out "${ICONSET}/icon_32x32@2x.png"   > /dev/null 2>&1
+    sips -z 128 128   "${ICON_SOURCE}" --out "${ICONSET}/icon_128x128.png"    > /dev/null 2>&1
+    sips -z 256 256   "${ICON_SOURCE}" --out "${ICONSET}/icon_128x128@2x.png" > /dev/null 2>&1
+    sips -z 256 256   "${ICON_SOURCE}" --out "${ICONSET}/icon_256x256.png"    > /dev/null 2>&1
+    sips -z 512 512   "${ICON_SOURCE}" --out "${ICONSET}/icon_256x256@2x.png" > /dev/null 2>&1
+    sips -z 512 512   "${ICON_SOURCE}" --out "${ICONSET}/icon_512x512.png"    > /dev/null 2>&1
+    sips -z 1024 1024 "${ICON_SOURCE}" --out "${ICONSET}/icon_512x512@2x.png" > /dev/null 2>&1
+
+    # Convert to .icns
+    iconutil -c icns "${ICONSET}" -o "${RESOURCES}/AppIcon.icns"
+    rm -rf "${ICONSET}"
+
+    ICON_KEY="    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>"
+else
+    echo "⚠️  No icon source found at Resources/AppIcon.png — skipping icon."
+    ICON_KEY=""
+fi
 
 # Create Info.plist
 cat > "${CONTENTS}/Info.plist" << EOF
@@ -65,12 +95,7 @@ cat > "${CONTENTS}/Info.plist" << EOF
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>NSSupportsAutomaticTermination</key>
-    <false/>
-    <key>NSSupportsSuddenTermination</key>
-    <false/>
-    <key>NSSystemAdministrationUsageDescription</key>
-    <string>Sidecar needs permission to move applications and create symbolic links.</string>
+${ICON_KEY}
 </dict>
 </plist>
 EOF
