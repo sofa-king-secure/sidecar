@@ -1,6 +1,13 @@
 # Sidecar
 
-**Keep your Mac's internal drive clean.** Sidecar automatically offloads heavy application data to an external USB4 drive using symbolic links — saving gigabytes without breaking your apps.
+<p align="center">
+  <img src="Resources/AppIcon.png" alt="Sidecar" width="200" />
+</p>
+
+<p align="center">
+  <strong>Keep your Mac's internal drive clean.</strong><br>
+  Automatically offload heavy application data to an external USB4 drive using symbolic links — saving gigabytes without breaking your apps.
+</p>
 
 ---
 
