@@ -155,9 +155,9 @@ final class SidecarAppState: ObservableObject {
 
     private var directoryMonitor: DirectoryMonitor?
     private var volumeMonitor: VolumeMonitor?
-    private let manifest = MigrationManifest()
-    private lazy var migrator = AppMigrator(manifest: manifest)
-    private lazy var disconnectGuard = DisconnectGuard(manifest: manifest)
+    private let manifest: MigrationManifest
+    private let migrator: AppMigrator
+    private let disconnectGuard: DisconnectGuard
     private let libraryScanner = LibraryScanner()
     private let diskAnalyzer = DiskAnalyzer()
     private let config = SidecarConfig.shared
@@ -165,6 +165,12 @@ final class SidecarAppState: ObservableObject {
     // MARK: Init
 
     init() {
+        // Initialize manifest and dependents first, before accessing self.
+        let manifest = MigrationManifest()
+        self.manifest = manifest
+        self.migrator = AppMigrator(manifest: manifest)
+        self.disconnectGuard = DisconnectGuard(manifest: manifest)
+
         let prefs = SidecarConfig.shared.state.preferences
         self.showOnboarding = SidecarConfig.shared.needsOnboarding
         self.autoMigrate = prefs.autoMigrateNewApps
@@ -318,31 +324,43 @@ final class SidecarAppState: ObservableObject {
         let footprints = await libraryScanner.scanAllApps()
         let state = diskAnalyzer.currentDiskState()
         let candidates = diskAnalyzer.prioritize(footprints: footprints, diskState: state)
-        let plan = diskAnalyzer.recommendMigrationPlan(candidates: candidates, diskState: state)
+
+        // Debug logging
+        print("[Sidecar] Scan found \(footprints.count) third-party apps.")
+        for fp in footprints {
+            let libSize = fp.libraryItems.reduce(0) { $0 + $1.sizeBytes }
+            let libFormatted = ByteCountFormatter.string(fromByteCount: Int64(libSize), countStyle: .file)
+            print("[Sidecar]   \(fp.appBundleURL.lastPathComponent): \(fp.libraryItems.count) library items, \(libFormatted) library data")
+        }
+        print("[Sidecar] \(candidates.count) candidate(s) after scoring.")
+        for c in candidates {
+            print("[Sidecar]   \(c.footprint.appBundleURL.lastPathComponent): score=\(Int(c.score)), reclaimable=\(c.formattedReclaimable)")
+        }
 
         status = .active
 
-        if plan.toMigrate.isEmpty {
+        if candidates.isEmpty {
             showAlert(
                 title: "All Clear",
-                message: "No apps meet the migration threshold, or disk space is sufficient."
+                message: "No apps have Library data large enough to migrate (minimum 50 MB)."
             )
             return
         }
 
-        let totalReclaimable = plan.toMigrate.reduce(0) { $0 + $1.reclaimableBytes }
+        // Show ALL candidates — user clicked Scan & Recommend, show what's available.
+        let totalReclaimable = candidates.reduce(0) { $0 + $1.reclaimableBytes }
         let formatted = ByteCountFormatter.string(fromByteCount: Int64(totalReclaimable), countStyle: .file)
-        let appList = plan.toMigrate
-            .map { "• \($0.footprint.appBundleURL.deletingPathExtension().lastPathComponent) (\($0.formattedReclaimable))" }
+        let appList = candidates
+            .map { "• \($0.footprint.appBundleURL.deletingPathExtension().lastPathComponent) (\($0.formattedReclaimable) Library data)" }
             .joined(separator: "\n")
 
         let proceed = await promptScanResults(
-            message: "Found \(plan.toMigrate.count) app(s) to migrate, freeing ~\(formatted):\n\n\(appList)"
+            message: "Found \(candidates.count) app(s) with migratable Library data, totaling ~\(formatted):\n\n\(appList)"
         )
 
         guard proceed else { return }
 
-        for candidate in plan.toMigrate {
+        for candidate in candidates {
             do {
                 try await migrator.migrateLibraryData(
                     footprint: candidate.footprint,
