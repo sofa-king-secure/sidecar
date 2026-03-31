@@ -1,179 +1,106 @@
-# Project Sidecar — User Guide
+# User Guide
 
-## What is Sidecar?
+## What Sidecar Does
 
-Sidecar is a macOS menu bar utility that keeps your internal drive clean by automatically migrating third-party applications and their data to an external USB4 drive. It replaces the originals with invisible symbolic links so everything continues to work normally — apps launch from the same place, Spotlight finds them, updates work — but the actual files live on your external drive.
+Sidecar saves space on your Mac's internal drive by moving heavy application data folders to an external drive. It creates invisible symbolic links so apps find their data in the expected location — they don't know anything changed.
 
----
+Your apps stay in `/Applications`. Only the bulky data subdirectories inside `~/Library/Application Support/` and `~/Library/Caches/` get moved.
 
-## First Launch (Setup Wizard)
+## The Menu Bar
 
-When you run Sidecar for the first time, a setup wizard walks you through configuration:
+Sidecar lives in your menu bar as a small drive icon. The icon changes based on status:
 
-1. **Welcome** — Overview of what Sidecar does.
-2. **Drive Selection** — Sidecar scans for connected external drives. Select the one you want to use. The drive must be formatted as **APFS** or **Mac OS Extended (HFS+)**. ExFAT, FAT32, and NTFS drives will appear but cannot be selected (they don't support macOS symlinks or file permissions).
-3. **System Check** — Verifies that Terminal/Sidecar has **Full Disk Access** (required to move files in /Applications), and shows your current internal drive usage.
-4. **Initial Scan** — Scans all installed third-party apps and their ~/Library data, then shows candidates ranked by size. You can select which ones to migrate now or skip and let Sidecar handle future installs.
-5. **Start Sidecar** — Completes setup. The wizard window closes and Sidecar runs as a **menu bar icon** (the external drive icon near your clock).
+| Icon | Meaning |
+|------|---------|
+| Drive with checkmark | Active — external drive connected, monitoring |
+| Drive with X | Drive missing — external drive not connected |
+| Drive with ? | Scanning |
+| Drive with + | Setup required |
 
----
+## Scanning & Migrating
 
-## Menu Bar Interface
+Click **Scan & Migrate** to find migratable data:
 
-After setup, Sidecar lives entirely in your menu bar. Click the drive icon to see:
+1. Sidecar scans every third-party app in `/Applications`
+2. For each app, it looks inside `~/Library/Application Support/{app}/` for subdirectories larger than 10 MB
+3. It also checks `~/Library/Caches/{app}` folders
+4. Results appear in a checklist window grouped by app
+5. Check the items you want to move, uncheck what you want to keep local
+6. Click **Migrate Selected**
 
-- **Status** — Active (drive mounted, monitoring), Drive Missing (drive disconnected), Scanning.
-- **Disk info** — How much free space is on your internal drive.
-- **Migrated count** — How many apps have been moved.
-- **Scan & Recommend** — Manually scan all apps and get migration recommendations.
-- **Health Check** — Verify all symlinks are intact.
-- **Settings** — Toggle preferences (see below).
-- **Quit** — Stop Sidecar.
+Items that are already on the external drive won't appear in the list.
 
----
+## Viewing Status
 
-## Settings Explained
+Click **View Status & Health** to see:
 
-### Auto-migrate new apps
-**Default: ON**
+- **Drive status** — Connected or disconnected, with total data on external drive
+- **Disk usage** — Visual bar showing internal drive usage percentage
+- **Per-app breakdown** — Each migrated app with its items listed
+- **Health indicators** — Per-item status showing whether symlinks are healthy
+- **History** — Previously rolled-back migrations
 
-When ON: Every time you install a new third-party app in /Applications, Sidecar detects it, scans its full footprint (app bundle + Library data), and prompts you to migrate it if it's above the size threshold (50 MB).
+## Settings
 
-When OFF: Sidecar still monitors /Applications but stays silent. You control migrations manually via "Scan & Recommend" in the menu bar. Use this if you prefer to batch-migrate on your own schedule rather than being prompted after every install.
-
-**Toggling it back ON** resumes automatic detection prompts immediately. Nothing is lost — it just controls whether you get prompted or not.
-
-### Migrate Library data
-**Default: ON**
-
-When ON: Sidecar moves not just the .app bundle but also associated data in ~/Library — Application Support folders, Caches, Saved State, Logs, WebKit data, and more. This is where the real space savings are. A 500 MB app might have 5 GB of Library data.
-
-When OFF: Sidecar only moves the .app bundle itself and creates a symlink. Library data stays on your internal drive. Use this if you're concerned about compatibility or if a specific app breaks after migration.
-
-**Toggling it back ON** applies to future migrations only — it does not retroactively migrate Library data for apps already moved. Run "Scan & Recommend" to pick up anything that was missed.
+### Auto-prompt for new apps
+When enabled, Sidecar will prompt you whenever a new app is installed in `/Applications`, offering to migrate its data. When disabled, you control everything manually through Scan & Migrate.
 
 ### Launch at login
-**Default: OFF**
+When enabled, Sidecar starts automatically when you log in and runs silently in the menu bar. When disabled, you need to launch it manually.
 
-**Note: This setting is not yet functional (v0.1).** Toggling it saves the preference but does not currently register a Launch Agent. In a future update, turning this on will create a LaunchAgent plist so Sidecar starts automatically when you log in.
+## What Happens When the Drive Is Disconnected
 
-For now, to start Sidecar you need to run it manually:
-```bash
-cd ~/Developer/sidecar
-swift run ProjectSidecar
-```
+This is the most important thing to understand:
 
----
+1. **Sidecar detects the disconnect** and replaces dead symlinks with empty placeholder directories
+2. **Your apps can still launch** — they just don't have access to the offloaded data
+3. **If you launch a migrated app**, Sidecar shows a warning dialog with two options:
+   - **Quit the app** and connect the drive
+   - **Continue without data** — the app runs in a degraded state
+4. **When the drive reconnects**, Sidecar restores the symlinks automatically
 
-## How Migration Works
+Your core app functionality is never broken. Settings, login state, and preferences stay on the internal drive. Only caches, VM bundles, and large data directories are affected.
 
-When Sidecar migrates an app, here's exactly what happens:
+## What Can and Can't Be Migrated
 
-1. **Scan** — Reads the app's bundle identifier from its Info.plist, then searches 9 directories in ~/Library for matching data (Application Support, Containers, Group Containers, Caches, Preferences, Saved Application State, Logs, HTTPStorages, WebKit).
+### Works well
+- Application Support subdirectories (caches, VMs, code indexes)
+- ~/Library/Caches folders (regenerable by the app)
+- ~/Library/Logs folders
 
-2. **Score** — Calculates a priority score (0-100) based on total footprint size, how much is Library data vs. app bundle, and current disk pressure. Apps under 50 MB total are skipped.
+### Doesn't work
+- The .app bundle itself — macOS blocks launching symlinked apps from external drives
+- The parent Application Support folder — Electron apps reject this
+- ~/Library/Containers — sandboxed apps check real paths
+- Anything under 10 MB — not worth the overhead
 
-3. **Move** — Uses macOS FileManager to move the .app bundle to your external drive's /Applications folder. Preserves all file attributes and permissions.
-
-4. **Symlink** — Creates a symbolic link at the original location (/Applications/AppName.app) pointing to the external drive copy. macOS treats this transparently — Spotlight, Launchpad, and the Dock all work normally.
-
-5. **Library data** — For safe categories (Application Support, Caches, Logs, etc.), moves the folder and creates a symlink. For sandboxed containers (~/Library/Containers), copies the data as a backup but leaves the original in place (sandboxed apps reject symlinked containers).
-
-6. **Record** — Saves a manifest entry in ~/Library/Application Support/ProjectSidecar/manifest.json tracking every file that was moved, so it can be rolled back.
-
----
-
-## What Gets Migrated (and What Doesn't)
-
-### Always migrated (if above size threshold)
-- The .app bundle itself
-- ~/Library/Application Support/{app name or bundle ID}
-- ~/Library/Caches/{bundle ID} (if enabled)
-- ~/Library/Saved Application State/{bundle ID}
-- ~/Library/Logs/{app name or bundle ID}
-- ~/Library/HTTPStorages/{bundle ID}
-- ~/Library/WebKit/{bundle ID}
-
-### Copied but not symlinked
-- ~/Library/Containers/{bundle ID} — Sandboxed apps check the real path; symlinks break them. Sidecar copies this data to the external drive as a backup but leaves the original.
-- ~/Library/Group Containers/ — Same reason.
-
-### Never touched
-- Apple/system apps (/System/Applications, anything signed by Apple)
-- Apps under 50 MB total footprint
-- ~/Library/Preferences/*.plist files under 1 MB (tiny config files, not worth it)
-
----
+### Tested apps
+| App | What moves | Size saved | Works without drive? |
+|-----|-----------|------------|---------------------|
+| Claude Desktop | vm_bundles, claude-code-vm, claude-code, Cache, Code Cache | ~13.5 GB | Yes — chat works, Claude Code features unavailable |
+| Firefox | Caches/Firefox, Profiles | ~1.3 GB | Not tested yet |
 
 ## Rollback
 
-Every migration can be undone. If an app breaks after migration, or you want to bring it back to the internal drive:
+If something breaks after migration, you can restore data to the internal drive:
 
-1. The manifest at ~/Library/Application Support/ProjectSidecar/manifest.json tracks every move.
-2. Rollback (coming in a future UI update) moves the app and all Library data back to their original locations and removes the symlinks.
-3. You can also manually undo a migration:
+**Using the CLI tool:**
+```bash
+python3 rollback.py
+```
+
+**Manually for a single item:**
 ```bash
 # Remove the symlink
-rm /Applications/AppName.app
+rm ~/Library/Application\ Support/AppName/broken_item
 
-# Move the app back from external drive
-mv /Volumes/YourDrive/Applications/AppName.app /Applications/
-
-# Do the same for any Library symlinks
+# Move data back from external drive
+mv /Volumes/YourDrive/Library/AppName/broken_item ~/Library/Application\ Support/AppName/
 ```
 
----
+## Tips
 
-## Health Check
-
-Sidecar monitors the integrity of all migrations:
-
-- **Runs automatically** when your external drive reconnects (if "Run health check on mount" is enabled).
-- **Run manually** from the menu bar via "Health Check".
-
-It detects three problems:
-
-1. **Symlink missing** — The symlink in /Applications was deleted entirely.
-2. **Target unreachable** — The symlink exists but the external drive isn't mounted (just means you need to plug it in).
-3. **Updater replaced symlink** — An app update (via App Store or Sparkle) deleted the symlink and installed a fresh copy. Sidecar alerts you so you can re-migrate.
-
----
-
-## Troubleshooting
-
-### "Failed to set up drive: permission denied"
-Grant Full Disk Access to Terminal (System Settings → Privacy & Security → Full Disk Access), and ensure your external drive is writable:
-```bash
-sudo chown -R $(whoami) /Volumes/YourDriveName/
-```
-
-### App won't launch after migration
-The external drive must be connected. If it's not, symlinks point to nothing and the app won't start. Plug the drive in and try again. If the app still fails, it may be a sandboxed app that rejects symlinked containers — roll back the migration.
-
-### Sidecar doesn't detect new apps
-Make sure Sidecar is running (check for the drive icon in the menu bar) and "Auto-migrate new apps" is enabled in Settings. The app must be installed in /Applications — apps in ~/Applications or other locations are not monitored.
-
-### "No apps meet the migration threshold"
-Your installed apps are all under 50 MB total footprint, or your disk has enough free space that Sidecar doesn't see urgency. You can lower the threshold in a future settings update.
-
----
-
-## File Locations
-
-| File | Purpose |
-|------|---------|
-| ~/Library/Application Support/ProjectSidecar/config.json | Settings, drive history, onboarding state |
-| ~/Library/Application Support/ProjectSidecar/manifest.json | Migration records for rollback |
-| /Volumes/{YourDrive}/.sidecar-meta/sidecar.json | Drive marker (identifies Sidecar drives) |
-| /Volumes/{YourDrive}/Applications/ | Migrated app bundles |
-| /Volumes/{YourDrive}/Library/ | Migrated Library data |
-
----
-
-## Current Limitations (v0.1)
-
-- **No settings UI for thresholds** — The 50 MB minimum and 30 GB target free space are hardcoded. A settings panel is planned.
-- **Launch at login not functional** — The toggle saves the preference but doesn't register a LaunchAgent yet.
-- **No rollback UI** — Rollback requires manual file operations or editing the manifest. A UI is planned.
-- **Single drive only** — Sidecar supports one external drive at a time.
-- **No periodic container sync** — Sandboxed container backups are one-time copies, not continuously synced.
+- **Close apps before migrating their data** — moving files while an app is using them can cause errors
+- **Start with one app** to test before migrating everything
+- **Check status after reconnecting** your drive to make sure everything is green
+- **Keep the drive connected** for best performance — symlinked data is read from the external drive, which may be slower than internal SSD

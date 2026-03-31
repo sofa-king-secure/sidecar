@@ -131,7 +131,16 @@ final class SidecarAppState: ObservableObject {
 
         let prefs = SidecarConfig.shared.state.preferences
         self.autoMigrate = prefs.autoMigrateNewApps
-        self.launchAtLogin = prefs.launchAtLogin
+
+        // Check actual LaunchAgent file, not just saved preference.
+        let launchAgentPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/com.projectsidecar.app.plist")
+        let agentExists = FileManager.default.fileExists(atPath: launchAgentPath.path)
+        self.launchAtLogin = agentExists
+        // Sync the preference to match reality.
+        if agentExists != prefs.launchAtLogin {
+            SidecarConfig.shared.updatePreferences { $0.launchAtLogin = agentExists }
+        }
 
         if SidecarConfig.shared.needsOnboarding {
             status = .needsSetup
