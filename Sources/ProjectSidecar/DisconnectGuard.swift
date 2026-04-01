@@ -73,10 +73,11 @@ final class DisconnectGuard {
     // MARK: - Drive Reconnected
 
     func onDriveReconnected() {
-        print("[Sidecar] Drive reconnected — restoring symlinks.")
+        print("[Sidecar] Drive reconnected — restoring symlinks and cleaning up.")
 
         stopAppLaunchMonitor()
 
+        // Step 1: Handle known placeholders (from this session's disconnect).
         for (index, ph) in placeholders.enumerated() {
             let modified = directoryHasContents(at: ph.localPath)
 
@@ -107,6 +108,97 @@ final class DisconnectGuard {
 
         placeholders.removeAll()
         savePlaceholders()
+
+        // Step 2: Full reconnect cleanup — check ALL manifest items.
+        // This catches cases where Sidecar wasn't running during disconnect,
+        // or where an app recreated directories locally.
+        reconnectCleanup()
+    }
+
+    /// Scans all active manifest items and ensures symlinks are correct.
+    /// If a local real directory exists where a symlink should be:
+    ///   - Merges any new local data into the external copy
+    ///   - Removes the local directory
+    ///   - Recreates the symlink
+    /// Also removes empty placeholder directories left behind.
+    func reconnectCleanup() {
+        let activeRecords = manifest.activeRecords
+        var cleanedCount = 0
+        var bytesReclaimed: UInt64 = 0
+
+        for record in activeRecords {
+            for lib in record.libraryMigrations where lib.isSymlinked {
+                let localPath = lib.originalPath
+                let externalPath = lib.externalPath
+
+                // Skip if it's already a working symlink.
+                if isWorkingSymlink(at: localPath, expectedTarget: externalPath) {
+                    continue
+                }
+
+                // Check if external target exists (drive is connected and data is there).
+                guard fileManager.fileExists(atPath: externalPath) else {
+                    print("[Sidecar] Cleanup: external target missing for \(localPath) — skipping.")
+                    continue
+                }
+
+                // Case 1: Local path is a real directory (app recreated it).
+                if !isSymlink(at: localPath) && fileManager.fileExists(atPath: localPath) {
+                    let localSize = directorySize(at: localPath)
+                    print("[Sidecar] Cleanup: local duplicate found at \(localPath) (\(formatBytes(localSize)))")
+
+                    let tempPath = localPath + ".sidecar-cleanup"
+                    do {
+                        // Move local to temp.
+                        try fileManager.moveItem(atPath: localPath, toPath: tempPath)
+
+                        // Restore symlink.
+                        try fileManager.createSymbolicLink(
+                            atPath: localPath,
+                            withDestinationPath: externalPath
+                        )
+
+                        // Merge any new data from local into external.
+                        try mergeDirectories(from: tempPath, into: externalPath)
+
+                        // Remove temp.
+                        try fileManager.removeItem(atPath: tempPath)
+
+                        bytesReclaimed += localSize
+                        cleanedCount += 1
+                        print("[Sidecar]   ✅ Cleaned: \(localPath) — \(formatBytes(localSize)) reclaimed")
+                    } catch {
+                        print("[Sidecar]   ❌ Cleanup failed for \(localPath): \(error)")
+                        // Try to restore original state.
+                        if !fileManager.fileExists(atPath: localPath),
+                           fileManager.fileExists(atPath: tempPath) {
+                            try? fileManager.moveItem(atPath: tempPath, toPath: localPath)
+                        }
+                    }
+                }
+
+                // Case 2: Dead symlink (shouldn't happen if drive is connected, but just in case).
+                if isDeadSymlink(at: localPath) {
+                    do {
+                        try fileManager.removeItem(atPath: localPath)
+                        try fileManager.createSymbolicLink(
+                            atPath: localPath,
+                            withDestinationPath: externalPath
+                        )
+                        cleanedCount += 1
+                        print("[Sidecar]   ✅ Fixed dead symlink: \(localPath)")
+                    } catch {
+                        print("[Sidecar]   ❌ Failed to fix symlink: \(localPath): \(error)")
+                    }
+                }
+            }
+        }
+
+        if cleanedCount > 0 {
+            print("[Sidecar] Reconnect cleanup: \(cleanedCount) item(s) cleaned, \(formatBytes(bytesReclaimed)) reclaimed.")
+        } else {
+            print("[Sidecar] Reconnect cleanup: all items clean.")
+        }
     }
 
     // MARK: - App Launch Monitor
@@ -186,6 +278,42 @@ final class DisconnectGuard {
               type == .typeSymbolicLink else { return false }
         let target = try? fileManager.destinationOfSymbolicLink(atPath: path)
         return target.map { !fileManager.fileExists(atPath: $0) } ?? true
+    }
+
+    private func isSymlink(at path: String) -> Bool {
+        guard let attrs = try? fileManager.attributesOfItem(atPath: path),
+              let type = attrs[.type] as? FileAttributeType else { return false }
+        return type == .typeSymbolicLink
+    }
+
+    /// Check if a path is a working symlink pointing to the expected target.
+    private func isWorkingSymlink(at path: String, expectedTarget: String) -> Bool {
+        guard isSymlink(at: path) else { return false }
+        guard let target = try? fileManager.destinationOfSymbolicLink(atPath: path) else { return false }
+        return target == expectedTarget && fileManager.fileExists(atPath: target)
+    }
+
+    private func directorySize(at path: String) -> UInt64 {
+        let url = URL(fileURLWithPath: path)
+        guard let enumerator = fileManager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [],
+            errorHandler: nil
+        ) else { return 0 }
+
+        var total: UInt64 = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                  values.isRegularFile == true,
+                  let size = values.fileSize else { continue }
+            total += UInt64(size)
+        }
+        return total
+    }
+
+    private func formatBytes(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 
     private func directoryHasContents(at path: String) -> Bool {

@@ -279,30 +279,35 @@ struct StatusView: View {
         let path = lib.originalPath
         let fm = FileManager.default
 
-        // Check if the path exists at all
-        guard fm.fileExists(atPath: path) else {
-            return HealthStatus(icon: "xmark.circle.fill", label: "Missing", color: .red)
+        // First: check if it's a symlink (using attributesOfItem which doesn't follow symlinks)
+        if let attrs = try? fm.attributesOfItem(atPath: path),
+           let type = attrs[.type] as? FileAttributeType,
+           type == .typeSymbolicLink {
+            // It's a symlink — check if target is reachable
+            if let target = try? fm.destinationOfSymbolicLink(atPath: path),
+               fm.fileExists(atPath: target) {
+                return HealthStatus(icon: "checkmark.circle.fill", label: "Healthy", color: .green)
+            } else {
+                // Dead symlink — is the drive just disconnected?
+                if driveConnected {
+                    return HealthStatus(icon: "xmark.circle.fill", label: "Broken", color: .red)
+                } else {
+                    return HealthStatus(icon: "minus.circle.fill", label: "Drive Off", color: .yellow)
+                }
+            }
         }
 
-        // Check if it's a symlink
-        guard let attrs = try? fm.attributesOfItem(atPath: path),
-              let type = attrs[.type] as? FileAttributeType,
-              type == .typeSymbolicLink else {
-            // Exists but not a symlink — app may have recreated it
+        // Not a symlink — check if something exists at the path
+        if fm.fileExists(atPath: path) {
+            // Real directory exists — app may have recreated it
             return HealthStatus(icon: "exclamationmark.triangle.fill", label: "Replaced", color: .orange)
         }
 
-        // Check if target is reachable
-        if let target = try? fm.destinationOfSymbolicLink(atPath: path),
-           fm.fileExists(atPath: target) {
-            return HealthStatus(icon: "checkmark.circle.fill", label: "Healthy", color: .green)
-        } else {
-            if driveConnected {
-                return HealthStatus(icon: "xmark.circle.fill", label: "Broken", color: .red)
-            } else {
-                return HealthStatus(icon: "minus.circle.fill", label: "Drive Off", color: .yellow)
-            }
+        // Nothing at this path at all
+        if !driveConnected {
+            return HealthStatus(icon: "minus.circle.fill", label: "Drive Off", color: .yellow)
         }
+        return HealthStatus(icon: "xmark.circle.fill", label: "Missing", color: .red)
     }
 
     // MARK: - Computed

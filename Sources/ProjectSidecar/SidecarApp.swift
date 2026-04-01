@@ -352,15 +352,11 @@ final class SidecarAppState: ObservableObject {
     // MARK: - Status & Health Check
 
     func showStatus() {
-        let driveConnected: Bool
-        let driveName: String
+        let driveName = config.configuredVolumeName ?? "Unknown"
 
-        if case .mounted = volumeMonitor?.state {
-            driveConnected = true
-        } else {
-            driveConnected = false
-        }
-        driveName = config.configuredVolumeName ?? "Unknown"
+        // Check actual mount state — don't just trust VolumeMonitor cache.
+        let drivePath = "/Volumes/\(driveName)"
+        let driveConnected = FileManager.default.fileExists(atPath: drivePath)
 
         let diskState = diskAnalyzer.currentDiskState()
 
